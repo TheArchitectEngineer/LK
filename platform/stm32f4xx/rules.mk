@@ -24,6 +24,8 @@ endif
 ifeq ($(STM32_CHIP),stm32f429)
 FOUND_CHIP := true
 GLOBAL_COMPILEFLAGS += -DSTM32F429_439xx=1
+# only the F42x/F43x parts have the SDRAM capable FMC controller
+MODULE_SRCS += $(LOCAL_DIR)/sdram.c
 endif
 
 ifeq ($(FOUND_CHIP),)
