@@ -61,7 +61,7 @@ static ssize_t elf_read_hook_memory(struct elf_handle *handle, void *buf, uint64
 
     memcpy(buf, args->ptr + offset, toread);
 
-    LTRACEF("returning %ld\n", toread);
+    LTRACEF("returning %zd\n", toread);
 
     return toread;
 }
@@ -235,7 +235,7 @@ status_t elf_load(elf_handle_t *handle) {
             LTRACEF("reading segment at offset 0x" ELF_OFF_PRINT_X " to address %p\n", pheader->p_offset, ptr);
             readerr = handle->read_hook(handle, ptr, pheader->p_offset, pheader->p_filesz);
             if (readerr < (ssize_t)pheader->p_filesz) {
-                LTRACEF("error %ld reading program header %u\n", readerr, i);
+                LTRACEF("error %zd reading program header %u\n", readerr, i);
                 return (readerr < 0) ? readerr : ERR_IO;
             }
 

@@ -275,21 +275,21 @@ status_t irc_client::handshake() {
     snprintf(buf, sizeof(buf), "USER %s host server :geist\r\n", IRC_USER);
     auto err = tcp_write(sock_, buf, strlen(buf));
     if (err < 0) {
-        printf("error %ld writing to server\n", err);
+        printf("error %zd writing to server\n", err);
         return static_cast<status_t>(err);
     }
 
     snprintf(buf, sizeof(buf), "NICK %s\r\n", IRC_NICK);
     err = tcp_write(sock_, buf, strlen(buf));
     if (err < 0) {
-        printf("error %ld writing to server\n", err);
+        printf("error %zd writing to server\n", err);
         return static_cast<status_t>(err);
     }
 
     snprintf(buf, sizeof(buf), "JOIN %s\r\n", IRC_CHAN);
     err = tcp_write(sock_, buf, strlen(buf));
     if (err < 0) {
-        printf("error %ld writing to server\n", err);
+        printf("error %zd writing to server\n", err);
         return static_cast<status_t>(err);
     }
 

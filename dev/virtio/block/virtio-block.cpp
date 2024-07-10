@@ -393,7 +393,7 @@ enum handler_return virtio_block_irq_driver_callback(virtio_device *dev, uint ri
         // async
         ssize_t result =
             (txn->status == VIRTIO_BLK_S_OK) ? (ssize_t)txn->len : ERR_IO;
-        LTRACEF("calling callback %p with cookie %p, len %ld\n", txn->callback,
+        LTRACEF("calling callback %p with cookie %p, len %zd\n", txn->callback,
                 txn->cookie, result);
         txn->callback(txn->cookie, &bdev->bdev, result);
     }

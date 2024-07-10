@@ -503,5 +503,5 @@ void ahci_port::register_async_callback(uint slot, bio_async_callback_t callback
     async_cmds_[slot].callback_context = callback_context;
     async_cmds_[slot].bytes_to_read_write = bytes_to_transfer;
 
-    LTRACEF("registered async callback for slot %u, %ld bytes\n", slot, bytes_to_transfer);
+    LTRACEF("registered async callback for slot %u, %zd bytes\n", slot, bytes_to_transfer);
 }

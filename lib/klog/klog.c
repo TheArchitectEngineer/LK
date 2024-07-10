@@ -525,13 +525,13 @@ usage:
         }
         ssize_t count = klog_read(buf, len, buf_id);
         if (count > 0) {
-            printf("read %ld byte(s): \"", count);
+            printf("read %zd byte(s): \"", count);
             for (ssize_t i = 0; i < count; i++)
                 putchar(buf[i]);
             putchar('\"');
             putchar('\n');
         } else {
-            printf("read returned error: %ld\n", count);
+            printf("read returned error: %zd\n", count);
         }
         free(buf);
     } else if (!strcmp(argv[1].str, "getc")) {

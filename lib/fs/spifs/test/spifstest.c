@@ -984,7 +984,7 @@ static int spifs_bench(int argc, const console_cmd_args *argv) {
 
         if (n_bytes < 0) {
             printf("SPIFS Benchmark Failed to write to file at %s. "
-                   "Reason = %ld.\n",
+                   "Reason = %zd.\n",
                    test_file_path, n_bytes);
             retcode = -1;
             fs_close_file(handle);
@@ -1006,7 +1006,7 @@ static int spifs_bench(int argc, const console_cmd_args *argv) {
 
         if (n_bytes < 0) {
             printf("SPIFS Benchmark Failed to read from file at %s. "
-                   "Reason = %ld.\n",
+                   "Reason = %zd.\n",
                    test_file_path, n_bytes);
             retcode = -1;
             fs_close_file(handle);
