@@ -446,6 +446,13 @@ status_t virtio_gpu_init(virtio_device *dev) {
 
     // XXX check features bits and ack/nak them
 
+    /* confirm the feature set before configuring the queue */
+    status_t err = dev->bus()->virtio_status_features_ok();
+    if (err != NO_ERROR) {
+        TRACEF("virtio-gpu: device rejected feature negotiation\n");
+        return err;
+    }
+
     /* allocate a virtio ring */
     dev->virtio_alloc_ring(0, 16);
 
