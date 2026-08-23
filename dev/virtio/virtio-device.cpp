@@ -139,8 +139,18 @@ status_t virtio_device::virtio_alloc_ring(uint index, uint16_t len) {
     LTRACEF("need %zu bytes\n", size);
 
 #if WITH_KERNEL_VM
+    // The ring is plain memory shared with the device, not MMIO, so map it cached and
+    // rely on the explicit barriers around the avail/used index updates for ordering.
+    //
+    // Mapping it Device/uncached instead breaks under KVM on real ARM hardware: the guest's
+    // non-cacheable accesses go straight to the point of coherency while the VMM touches the
+    // same page through a normal cacheable mapping, and nothing keeps the two in sync unless
+    // the CPU implements FEAT_S2FWB (ARMv8.4) to force the guest mapping back to write-back.
+    // On an ARMv8.2 core such as the Cortex-A76 the VMM simply never observes the guest's
+    // avail->idx update, so the request is never processed and the driver waits forever.
+    // Emulation hides this because TCG does not model caches at all.
     void *vptr;
-    status_t err = vmm_alloc_contiguous(vmm_get_kernel_aspace(), "virtio_ring", size, &vptr, 0, 0, ARCH_MMU_FLAG_UNCACHED_DEVICE);
+    status_t err = vmm_alloc_contiguous(vmm_get_kernel_aspace(), "virtio_ring", size, &vptr, 0, 0, ARCH_MMU_FLAG_CACHED);
     if (err < 0)
         return ERR_NO_MEMORY;
 
