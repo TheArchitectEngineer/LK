@@ -132,22 +132,37 @@ void virtio_mmio_bus::virtio_status_acknowledge_driver() {
     }
 }
 
-void virtio_mmio_bus::virtio_status_driver_ok() {
-    uint32_t status = virtio_mmio_read32(&mmio_config_->status);
-
-    if (mmio_version_ == 2 && !(status & VIRTIO_STATUS_FEATURES_OK)) {
-        status |= VIRTIO_STATUS_FEATURES_OK;
-        virtio_mmio_write32(&mmio_config_->status, status);
-
-        status = virtio_mmio_read32(&mmio_config_->status);
-        if (!(status & VIRTIO_STATUS_FEATURES_OK)) {
-            status |= VIRTIO_STATUS_FAILED;
-            virtio_mmio_write32(&mmio_config_->status, status);
-            printf("virtio-mmio v2: device rejected feature negotiation\n");
-            return;
-        }
+status_t virtio_mmio_bus::virtio_status_features_ok() {
+    // V1 (legacy) has no FEATURES_OK bit.
+    if (mmio_version_ != 2) {
+        return NO_ERROR;
     }
 
+    uint32_t status = virtio_mmio_read32(&mmio_config_->status);
+    if (status & VIRTIO_STATUS_FEATURES_OK) {
+        return NO_ERROR;
+    }
+
+    status |= VIRTIO_STATUS_FEATURES_OK;
+    virtio_mmio_write32(&mmio_config_->status, status);
+
+    // The device clears the bit back out if it does not accept the negotiated set.
+    status = virtio_mmio_read32(&mmio_config_->status);
+    if (!(status & VIRTIO_STATUS_FEATURES_OK)) {
+        virtio_mmio_write32(&mmio_config_->status, status | VIRTIO_STATUS_FAILED);
+        printf("virtio-mmio v2: device rejected feature negotiation\n");
+        return ERR_NOT_SUPPORTED;
+    }
+
+    return NO_ERROR;
+}
+
+void virtio_mmio_bus::virtio_status_driver_ok() {
+    if (virtio_status_features_ok() != NO_ERROR) {
+        return;
+    }
+
+    uint32_t status = virtio_mmio_read32(&mmio_config_->status);
     status |= VIRTIO_STATUS_DRIVER_OK;
     virtio_mmio_write32(&mmio_config_->status, status);
 }

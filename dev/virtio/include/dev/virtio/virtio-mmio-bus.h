@@ -23,6 +23,7 @@ public:
     void virtio_status_acknowledge_driver() override;
     uint32_t virtio_read_host_feature_word(uint32_t word) override;
     void virtio_set_guest_features(uint32_t word, uint32_t features) override;
+    status_t virtio_status_features_ok() override;
     void virtio_status_driver_ok() override;
     void virtio_kick(uint16_t ring_index) override;
 

@@ -148,19 +148,41 @@ void virtio_pci_bus::virtio_reset_device() {
 
 void virtio_pci_bus::virtio_status_acknowledge_driver() {
     common_config()->device_status |= VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER;
+
+    if (!legacy_) {
+        // Modern virtio requires VERSION_1 (feature bit 32). Drivers reset the device on entry,
+        // which drops whatever init() negotiated, so re-acknowledge it here where every driver
+        // picks it up. This mirrors what the mmio v2 transport does.
+        constexpr uint32_t version1_bit_word1 = static_cast<uint32_t>(VIRTIO_F_VERSION_1 >> 32);
+        uint32_t host_features_word1 = virtio_read_host_feature_word(1);
+        virtio_set_guest_features(1, host_features_word1 & version1_bit_word1);
+    }
+}
+
+status_t virtio_pci_bus::virtio_status_features_ok() {
+    // Legacy (transitional) transport has no FEATURES_OK bit.
+    if (legacy_) {
+        return NO_ERROR;
+    }
+    if (common_config()->device_status & VIRTIO_STATUS_FEATURES_OK) {
+        return NO_ERROR;
+    }
+
+    // Set FEATURES_OK and read it back, since the device clears it to reject the
+    // negotiated feature set.
+    common_config()->device_status |= VIRTIO_STATUS_FEATURES_OK;
+    if (!(common_config()->device_status & VIRTIO_STATUS_FEATURES_OK)) {
+        common_config()->device_status |= VIRTIO_STATUS_FAILED;
+        printf("virtio-pci: device rejected feature negotiation\n");
+        return ERR_NOT_SUPPORTED;
+    }
+
+    return NO_ERROR;
 }
 
 void virtio_pci_bus::virtio_status_driver_ok() {
-    // Modern virtio requires confirming feature negotiation before DRIVER_OK:
-    // set FEATURES_OK and read it back, since the device may clear it to reject
-    // the negotiated feature set.
-    if (!legacy_ && !(common_config()->device_status & VIRTIO_STATUS_FEATURES_OK)) {
-        common_config()->device_status |= VIRTIO_STATUS_FEATURES_OK;
-        if (!(common_config()->device_status & VIRTIO_STATUS_FEATURES_OK)) {
-            common_config()->device_status |= VIRTIO_STATUS_FAILED;
-            printf("virtio-pci: device rejected feature negotiation\n");
-            return;
-        }
+    if (virtio_status_features_ok() != NO_ERROR) {
+        return;
     }
 
     common_config()->device_status |= VIRTIO_STATUS_DRIVER_OK;
