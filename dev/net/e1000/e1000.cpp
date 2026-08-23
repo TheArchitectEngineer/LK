@@ -55,6 +55,22 @@
 // The buffers are at least shaped for it already: the rx buffers are cache line aligned 2048 byte
 // slices of one allocation, and pktbuf pool objects are cache line aligned and a whole number of
 // lines long, so no buffer shares a line with another one.
+//
+// Two things are missing before any of that could be written, and neither is local to this file:
+//
+//   - A Normal Non-cacheable memory attribute. Both of the uncached arch mmu flags are Device
+//     types (ARCH_MMU_FLAG_UNCACHED is Device-nGnRnE, ARCH_MMU_FLAG_UNCACHED_DEVICE is
+//     Device-nGnRE; see MMU_MAIR_VAL in arch/arm64/include/arch/arm64/mmu.h), and Device is the
+//     wrong tool for a ring: it forbids speculation, preserves access size, requires strict
+//     alignment and cannot merge writes, all of which are there for MMIO and merely slow here.
+//     Linux allocates non-coherent DMA memory as Normal Non-cacheable for exactly this reason
+//     (arm64's pgprot_dmacoherent()); LK has no such MAIR entry to allocate against.
+//
+//   - A per device notion of whether DMA is coherent, rather than one answer compiled into each
+//     driver. That is what lets one driver source work on both kinds of system: firmware says
+//     which it is (`dma-coherent` in a device tree, _CCA in ACPI) and the allocation and the
+//     maintenance follow from that. Note qemu sets `dma-coherent` on the root node of the virt
+//     machine's tree, so a guest that honored it would arrive at what this driver hardcodes.
 
 #define LOCAL_TRACE 0
 
