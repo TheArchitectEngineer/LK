@@ -6,6 +6,7 @@
 // https://opensource.org/licenses/MIT
 
 #include <arch/atomic.h>
+#include <arch/ops.h>
 #include <dev/bus/pci.h>
 #include <kernel/event.h>
 #include <kernel/thread.h>
@@ -203,6 +204,8 @@ handler_return e1000::irq_handler() {
     if (icr & E1000_ICR_TXDW) { // TXDW - transmit descriptor written back
         // Walk from last known head to current TDH, freeing completed TX pktbufs.
         auto tdh = read_reg(e1000_reg::TDH);
+        // Order the descriptor and pktbuf accesses below after the TDH read.
+        rmb();
         while (tx_last_head_ != tdh) {
             if (tx_pktbuf_[tx_last_head_]) {
                 pktbuf_free(tx_pktbuf_[tx_last_head_], false);
@@ -233,6 +236,9 @@ handler_return e1000::irq_handler() {
         // Packets may be ready, or descriptors may need draining after overrun.
         auto rdh = read_reg(e1000_reg::RDH);
         auto rdt = read_reg(e1000_reg::RDT);
+        // The ring is normal cached memory, so the descriptor reads below have to be
+        // explicitly ordered after these register reads.
+        rmb();
 
         while (rx_last_head_ != rdh) {
             // copy the current rx descriptor locally for better cache performance
@@ -251,6 +257,10 @@ handler_return e1000::irq_handler() {
 
             bool consumed_pkt = false;
             if (rxd.status & E1000_RXD_STAT_DD) { // descriptor done, we own it now
+                // DD is what tells us the device has finished writing the buffer, so the
+                // reads of the received data have to be ordered after observing it.
+                rmb();
+
                 bool eop = (rxd.status & E1000_RXD_STAT_EOP);
 
                 if (rxd.errors == 0) {
@@ -372,8 +382,10 @@ int e1000::tx(pktbuf_t *p) {
     // save a copy of the pktbuf in our list
     tx_pktbuf_[tx_tail_] = p;
 
-    // bump tail forward
+    // bump tail forward. The descriptor and the packet it points at must be visible to the
+    // device before the tail register hands the descriptor over.
     tx_tail_ = (tx_tail_ + 1) % txring_len;
+    wmb();
     write_reg(e1000_reg::TDT, tx_tail_);
 
     LTRACEF("TDH %#x TDT %#x\n", read_reg(e1000_reg::TDH), read_reg(e1000_reg::TDT));
@@ -394,8 +406,10 @@ void e1000::add_pktbuf_to_rxring_locked(pktbuf_t *p) {
     // save a copy of the pktbuf in our list
     rx_pktbuf_[rx_tail_] = p;
 
-    // bump tail forward
+    // bump tail forward. The descriptor must be visible to the device before the tail
+    // register hands it over.
     rx_tail_ = (rx_tail_ + 1) % rxring_len;
+    wmb();
     write_reg(e1000_reg::RDT, rx_tail_);
 
     LTRACEF("after RDH %#x RDT %#x\n", read_reg(e1000_reg::RDH), read_reg(e1000_reg::RDT));
@@ -480,10 +494,21 @@ status_t e1000::init_device(pci_location_t loc, const e1000_id_features *id) {
     printf("e1000 %d: mac address %02x:%02x:%02x:%02x:%02x:%02x\n", unit_, mac_addr_[0],
            mac_addr_[1], mac_addr_[2], mac_addr_[3], mac_addr_[4], mac_addr_[5]);
 
-    // allocate and map space for the rx and tx ring
+    // Allocate and map space for the rx and tx ring.
+    //
+    // These are mapped cached, with explicit barriers around the head/tail registers doing the
+    // ordering. A Device/uncached mapping looks simpler but is wrong under KVM on an ARM core
+    // without FEAT_S2FWB (ARMv8.4): the guest's uncached accesses and the VMM's cached view of
+    // the same page never see each other, and the rings silently stop working. See the comment
+    // in virtio_device::virtio_alloc_ring().
+    //
+    // This does assume DMA is cache coherent, which holds for every bus this driver is reachable
+    // on today (PCI on x86 and on arm64 qemu virt). A non-coherent host would need explicit cache
+    // maintenance here instead, since a descriptor the CPU writes shares a cache line with three
+    // the device writes back.
     snprintf(str, sizeof(str), "e1000 %d rxring", unit_);
     err = vmm_alloc_contiguous(vmm_get_kernel_aspace(), str, rxring_len * sizeof(rdesc),
-                               reinterpret_cast<void **>(&rxring_), 0, 0, ARCH_MMU_FLAG_UNCACHED);
+                               reinterpret_cast<void **>(&rxring_), 0, 0, ARCH_MMU_FLAG_CACHED);
     if (err != NO_ERROR) {
         return ERR_NOT_FOUND;
     }
@@ -494,11 +519,11 @@ status_t e1000::init_device(pci_location_t loc, const e1000_id_features *id) {
 
     snprintf(str, sizeof(str), "e1000 %d txring", unit_);
     err = vmm_alloc_contiguous(vmm_get_kernel_aspace(), str, txring_len * sizeof(tdesc),
-                               reinterpret_cast<void **>(&txring_), 0, 0, ARCH_MMU_FLAG_UNCACHED);
+                               reinterpret_cast<void **>(&txring_), 0, 0, ARCH_MMU_FLAG_CACHED);
     if (err != NO_ERROR) {
         return ERR_NOT_FOUND;
     }
-    memset(txring_, 0, txring_len * sizeof(rdesc));
+    memset(txring_, 0, txring_len * sizeof(tdesc));
 
     paddr_t txring_phys = vaddr_to_paddr(txring_);
     LTRACEF("tx ring at %p, physical %#lx\n", txring_, txring_phys);
