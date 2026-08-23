@@ -149,6 +149,10 @@ status_t virtio_device::virtio_alloc_ring(uint index, uint16_t len) {
     // On an ARMv8.2 core such as the Cortex-A76 the VMM simply never observes the guest's
     // avail->idx update, so the request is never processed and the driver waits forever.
     // Emulation hides this because TCG does not model caches at all.
+    //
+    // This assumes DMA is cache coherent, which is true of every transport LK drives virtio over
+    // today. A non-coherent host would need explicit cache maintenance rather than barriers, and
+    // could not simply share a cache line between driver written and device written descriptors.
     void *vptr;
     status_t err = vmm_alloc_contiguous(vmm_get_kernel_aspace(), "virtio_ring", size, &vptr, 0, 0, ARCH_MMU_FLAG_CACHED);
     if (err < 0)

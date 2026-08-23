@@ -26,6 +26,36 @@
 #include "e1000_hw.h"
 #include "e1000_ids.h"
 
+// NOTE ON CACHE COHERENCY
+//
+// This driver assumes DMA is cache coherent. That holds on every bus it is reachable on today
+// (PCI on x86, and PCIe on the arm64 qemu virt machine), so the descriptor rings and the packet
+// buffers are ordinary cached memory and ordering is done with barriers alone: wmb() before the
+// TDT/RDT doorbells, rmb() after the TDH/RDH reads and after observing RXD_STAT_DD.
+//
+// The rings used to be mapped uncached with no barriers at all. That had to change because an
+// uncached guest mapping is broken under KVM on an ARM core without FEAT_S2FWB (ARMv8.4): the
+// guest's uncached accesses and the VMM's cached view of the same page never see each other.
+// See the comment in virtio_device::virtio_alloc_ring().
+//
+// A real e1000 behind a non-coherent interconnect -- an actual ARM SoC rather than an emulated
+// PCIe device -- would need more than barriers, and this driver does not do any of it:
+//
+//   - TX: the packet data and the descriptor have to be cleaned to the point of coherency before
+//     the TDT write, and the descriptor invalidated before its writeback status is read.
+//   - RX: the buffer and the descriptor have to be invalidated before they are read, so the DMA'd
+//     data is not shadowed by a stale line.
+//   - The descriptor rings would have to stop being cached, or be padded. rdesc and tdesc are 16
+//     bytes, so four share a 64 byte line, and invalidating a line to pick up one descriptor's
+//     writeback would discard driver writes to the three next to it. Keeping the rings uncached,
+//     which is what they were before, is the usual answer -- and it directly conflicts with what
+//     KVM on ARM needs, so a port to a non-coherent target would have to make the mapping a
+//     platform choice rather than the constant it is here.
+//
+// The buffers are at least shaped for it already: the rx buffers are cache line aligned 2048 byte
+// slices of one allocation, and pktbuf pool objects are cache line aligned and a whole number of
+// lines long, so no buffer shares a line with another one.
+
 #define LOCAL_TRACE 0
 
 namespace {
@@ -494,18 +524,9 @@ status_t e1000::init_device(pci_location_t loc, const e1000_id_features *id) {
     printf("e1000 %d: mac address %02x:%02x:%02x:%02x:%02x:%02x\n", unit_, mac_addr_[0],
            mac_addr_[1], mac_addr_[2], mac_addr_[3], mac_addr_[4], mac_addr_[5]);
 
-    // Allocate and map space for the rx and tx ring.
-    //
-    // These are mapped cached, with explicit barriers around the head/tail registers doing the
-    // ordering. A Device/uncached mapping looks simpler but is wrong under KVM on an ARM core
-    // without FEAT_S2FWB (ARMv8.4): the guest's uncached accesses and the VMM's cached view of
-    // the same page never see each other, and the rings silently stop working. See the comment
-    // in virtio_device::virtio_alloc_ring().
-    //
-    // This does assume DMA is cache coherent, which holds for every bus this driver is reachable
-    // on today (PCI on x86 and on arm64 qemu virt). A non-coherent host would need explicit cache
-    // maintenance here instead, since a descriptor the CPU writes shares a cache line with three
-    // the device writes back.
+    // Allocate and map space for the rx and tx ring. Mapped cached, with the barriers around the
+    // head/tail registers doing the ordering; see the note on cache coherency at the top of this
+    // file for what that assumes.
     snprintf(str, sizeof(str), "e1000 %d rxring", unit_);
     err = vmm_alloc_contiguous(vmm_get_kernel_aspace(), str, rxring_len * sizeof(rdesc),
                                reinterpret_cast<void **>(&rxring_), 0, 0, ARCH_MMU_FLAG_CACHED);
