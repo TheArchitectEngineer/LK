@@ -430,6 +430,9 @@ status_t fs_close_file(filehandle *handle) {
 }
 
 status_t fs_stat_file(filehandle *handle, struct file_stat *stat) {
+    // zero the struct so fields a filesystem does not fill in (e.g. capacity)
+    // read as zero instead of stack garbage
+    memset(stat, 0, sizeof(*stat));
     return handle->mount->api->stat(handle->cookie, stat);
 }
 
@@ -687,6 +690,7 @@ status_t fs_stat_fs(const char *mountpoint, struct fs_stat *stat) {
         return ERR_NOT_SUPPORTED;
     }
 
+    memset(stat, 0, sizeof(*stat));
     status_t result = mount->api->fs_stat(mount->cookie, stat);
 
     put_mount(mount);
