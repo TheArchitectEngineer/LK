@@ -116,6 +116,30 @@ so several configurations can coexist in one tree.
 
 The file local.mk is silently included if it exists in the root directory. Additional variables can be defined in this file to customize the build instead of needing to pass them on the command line.
 
+Because the inclusion is silent, it applies to test runs too, and nothing on the command
+line hints that it is in play. A `local.mk` setting `TOOLCHAIN`, `WERROR`, `DEBUG` or
+`LK_HEAP_IMPLEMENTATION` changes what `scripts/buildall` and
+`scripts/run-qemu-boot-tests.py` actually exercise, which is a common reason a local result
+disagrees with CI. The customary `?=` form only wins where nothing else sets the variable,
+so a single file can affect one pass and not another: `buildall` passes `TOOLCHAIN=gcc` on
+the command line for its gcc pass, which overrides a `TOOLCHAIN ?= clang` in `local.mk`,
+while its clang pass keeps whatever else the file sets.
+
+Set `IGNORE_LOCAL_MK=1` to skip the file entirely, either on the command line or in the
+environment, so a build depends only on the arguments it was given:
+
+```bash
+make qemu-virt-arm64-test IGNORE_LOCAL_MK=1
+IGNORE_LOCAL_MK=1 ./scripts/run-qemu-boot-tests.py --arch arm64
+IGNORE_LOCAL_MK=1 scripts/buildall -q -e
+```
+
+Use it before reproducing a CI failure, bisecting a build break, or concluding that a
+project builds clean. The scripts do not set it themselves, because `local.mk` is also
+where a toolchain prefix may live and skipping it would break a tree that depends on one;
+pass such settings explicitly alongside it. When reporting a build or test result, say
+which toolchain and flags actually applied rather than which ones were typed.
+
 ### Rust support (`USE_RUST=1`)
 
 Rust is opt-in per project. `qemu-virt-arm64-test`, `pc-x86-64-test`,

@@ -16,8 +16,15 @@ ifndef LKROOT
 $(error please define LKROOT to the root of the lk build system)
 endif
 
-# any local environment overrides can optionally be placed in local.mk
+# any local environment overrides can optionally be placed in local.mk.
+# Set IGNORE_LOCAL_MK=1 to skip it, so that a build depends only on the
+# arguments it was given. Useful when reproducing a CI result or bisecting a
+# build break, where a silently included local.mk is easy to overlook. Note
+# local.mk is also where a toolchain prefix may be set, so a build that relies
+# on one will need it passed explicitly instead.
+ifneq ($(IGNORE_LOCAL_MK),1)
 -include local.mk
+endif
 
 # If one of our goals (from the commandline) happens to have a
 # matching project/goal.mk, then we should re-invoke make with
