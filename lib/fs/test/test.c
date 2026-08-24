@@ -178,34 +178,107 @@ static bool test_remove_while_open(void) {
     END_TEST;
 }
 
-#define FLAT_MNT "/fs_flat_test"
+#define TREE_MNT "/fs_tree_test"
 
-static void test_flat_fs_semantics_teardown(void *ptr) {
-    fs_unmount(FLAT_MNT);
+static void test_hierarchy_teardown(void *ptr) {
+    fs_remove_file(TREE_MNT "/a/b/f");
+    fs_remove_dir(TREE_MNT "/a/b");
+    fs_remove_dir(TREE_MNT "/a");
+    fs_unmount(TREE_MNT);
 }
 
-// Pin down the contract a flat (no-directory) filesystem presents through the
-// fs layer, using memfs as the reference: directory-shaped requests are
-// ERR_NOT_SUPPORTED, missing names are ERR_NOT_FOUND, and the mount root is
-// the one openable directory.
-static bool test_flat_fs_semantics(void) {
-    __attribute__((cleanup(test_flat_fs_semantics_teardown))) BEGIN_TEST;
+// Directory tree behavior through the fs layer, using memfs as the
+// reference implementation of the vnode interface.
+static bool test_hierarchy(void) {
+    __attribute__((cleanup(test_hierarchy_teardown))) BEGIN_TEST;
 
-    ASSERT_EQ(NO_ERROR, fs_mount(FLAT_MNT, "memfs", NULL, FS_MOUNT_OPTION_NONE), "mount");
+    ASSERT_EQ(NO_ERROR, fs_mount(TREE_MNT, "memfs", NULL, FS_MOUNT_OPTION_NONE), "mount");
 
-    // no subdirectory support: mkdir and nested create are not supported
+    // nested directories, and a file at the bottom
+    ASSERT_EQ(NO_ERROR, fs_make_dir(TREE_MNT "/a"), "mkdir a");
+    ASSERT_EQ(NO_ERROR, fs_make_dir(TREE_MNT "/a/b"), "mkdir a/b");
+
     filehandle *h;
-    EXPECT_EQ(ERR_NOT_SUPPORTED, fs_make_dir(FLAT_MNT "/sub"), "mkdir on flat fs");
-    EXPECT_EQ(ERR_NOT_SUPPORTED, fs_create_file(FLAT_MNT "/sub/file", &h, 0), "nested create");
+    ASSERT_EQ(NO_ERROR, fs_create_file(TREE_MNT "/a/b/f", &h, 0), "create nested file");
+    char msg[] = "down here";
+    EXPECT_EQ((ssize_t)sizeof(msg), fs_write_file(h, msg, 0, sizeof(msg)), "write");
+    EXPECT_EQ(NO_ERROR, fs_close_file(h), "close");
 
-    // a name that simply does not exist is ERR_NOT_FOUND, not ERR_NOT_SUPPORTED
-    EXPECT_EQ(ERR_NOT_FOUND, fs_open_file(FLAT_MNT "/nope", &h), "open missing file");
+    // read it back through the full path
+    ASSERT_EQ(NO_ERROR, fs_open_file(TREE_MNT "/a/b/f", &h), "reopen nested file");
+    char buf[sizeof(msg)];
+    EXPECT_EQ((ssize_t)sizeof(msg), fs_read_file(h, buf, 0, sizeof(buf)), "read");
+    EXPECT_EQ(0, memcmp(msg, buf, sizeof(msg)), "content");
+    EXPECT_EQ(NO_ERROR, fs_close_file(h), "close reopened");
+
+    // enumerate an inner directory
     dirhandle *dh;
-    EXPECT_EQ(ERR_NOT_FOUND, fs_open_dir(FLAT_MNT "/nope", &dh), "open missing dir");
+    struct dirent ent;
+    ASSERT_EQ(NO_ERROR, fs_open_dir(TREE_MNT "/a", &dh), "open dir a");
+    ASSERT_EQ(NO_ERROR, fs_read_dir(dh, &ent), "read dir a");
+    EXPECT_EQ(0, strcmp(ent.name, "b"), "sole entry is b");
+    EXPECT_EQ(ERR_NOT_FOUND, fs_read_dir(dh, &ent), "eof");
+    EXPECT_EQ(NO_ERROR, fs_close_dir(dh), "close dir a");
 
-    // the root of the mount is openable as a directory
-    ASSERT_EQ(NO_ERROR, fs_open_dir(FLAT_MNT, &dh), "open mount root");
-    EXPECT_EQ(NO_ERROR, fs_close_dir(dh), "close mount root");
+    // a directory stats as one
+    ASSERT_EQ(NO_ERROR, fs_open_file(TREE_MNT "/a", &h), "open dir as handle");
+    struct file_stat st;
+    EXPECT_EQ(NO_ERROR, fs_stat_file(h, &st), "stat dir");
+    EXPECT_TRUE(st.is_dir, "is_dir");
+    EXPECT_EQ(NO_ERROR, fs_close_file(h), "close dir handle");
+
+    // name collisions and type confusion are refused with the right errors
+    EXPECT_EQ(ERR_ALREADY_EXISTS, fs_make_dir(TREE_MNT "/a"), "mkdir existing");
+    EXPECT_EQ(ERR_ALREADY_EXISTS, fs_create_file(TREE_MNT "/a", &h, 0), "create over dir");
+    EXPECT_EQ(ERR_NOT_ALLOWED, fs_remove_dir(TREE_MNT "/a"), "rmdir non-empty");
+    EXPECT_EQ(ERR_NOT_FILE, fs_remove_file(TREE_MNT "/a/b"), "remove on a dir");
+    EXPECT_EQ(ERR_NOT_DIR, fs_remove_dir(TREE_MNT "/a/b/f"), "rmdir on a file");
+    EXPECT_EQ(ERR_NOT_DIR, fs_open_file(TREE_MNT "/a/b/f/deeper", &h), "walk through a file");
+
+    // tear it down bottom-up; every level must really be gone
+    EXPECT_EQ(NO_ERROR, fs_remove_file(TREE_MNT "/a/b/f"), "remove file");
+    EXPECT_EQ(ERR_NOT_FOUND, fs_open_file(TREE_MNT "/a/b/f", &h), "file gone");
+    EXPECT_EQ(NO_ERROR, fs_remove_dir(TREE_MNT "/a/b"), "rmdir b");
+    EXPECT_EQ(ERR_NOT_FOUND, fs_open_dir(TREE_MNT "/a/b", &dh), "b gone");
+    EXPECT_EQ(NO_ERROR, fs_remove_dir(TREE_MNT "/a"), "rmdir a");
+    EXPECT_EQ(ERR_NOT_FOUND, fs_open_dir(TREE_MNT "/a", &dh), "a gone");
+
+    END_TEST;
+}
+
+#define SHARE_MNT "/fs_share_test"
+
+static void test_shared_object_teardown(void *ptr) {
+    fs_remove_file(SHARE_MNT "/f");
+    fs_unmount(SHARE_MNT);
+}
+
+// Two handles on one file must observe each other's writes: the layer
+// deduplicates vnodes by id, so both handles reach one object.
+static bool test_shared_object(void) {
+    __attribute__((cleanup(test_shared_object_teardown))) BEGIN_TEST;
+
+    ASSERT_EQ(NO_ERROR, fs_mount(SHARE_MNT, "memfs", NULL, FS_MOUNT_OPTION_NONE), "mount");
+
+    filehandle *h1, *h2;
+    ASSERT_EQ(NO_ERROR, fs_create_file(SHARE_MNT "/f", &h1, 0), "create");
+    ASSERT_EQ(NO_ERROR, fs_open_file(SHARE_MNT "/f", &h2), "second open");
+
+    char msg[] = "shared";
+    EXPECT_EQ((ssize_t)sizeof(msg), fs_write_file(h1, msg, 0, sizeof(msg)), "write via h1");
+
+    struct file_stat st;
+    EXPECT_EQ(NO_ERROR, fs_stat_file(h2, &st), "stat via h2");
+    EXPECT_EQ(sizeof(msg), st.size, "size seen via h2");
+
+    char buf[sizeof(msg)];
+    EXPECT_EQ((ssize_t)sizeof(msg), fs_read_file(h2, buf, 0, sizeof(buf)), "read via h2");
+    EXPECT_EQ(0, memcmp(msg, buf, sizeof(msg)), "content seen via h2");
+
+    EXPECT_EQ(NO_ERROR, fs_close_file(h1), "close h1");
+    EXPECT_EQ(NO_ERROR, fs_close_file(h2), "close h2");
+
+    EXPECT_EQ(NO_ERROR, fs_remove_file(SHARE_MNT "/f"), "remove");
 
     END_TEST;
 }
@@ -465,7 +538,8 @@ BEGIN_TEST_CASE(fs_tests);
 RUN_TEST(test_path_normalize);
 RUN_TEST(test_stdio_fs);
 RUN_TEST(test_remove_while_open);
-RUN_TEST(test_flat_fs_semantics);
+RUN_TEST(test_hierarchy);
+RUN_TEST(test_shared_object);
 RUN_TEST(test_readdir);
 RUN_TEST(test_unmount_with_open_handle);
 RUN_TEST(test_rootfs);

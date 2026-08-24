@@ -40,6 +40,7 @@
     _(test_corrupt_toc, 1, "Test that FS can be mounted with one corrupt ToC.")  \
     _(test_write_with_offset, 1, "Test that files can be written to at an offset.") \
     _(test_read_write_big, 1, "Test that an unaligned ~10kb buffer can be written and read.") \
+    _(test_flat_semantics, 1, "Test flat namespace error semantics through the fs layer.") \
     _(test_rm_active_dirent, 1, "Test that we can remove a file with an open dirent.") \
     _(test_rm_while_open, 1, "Test that removing an open file is refused with ERR_BUSY.") \
     _(test_truncate_file, 1, "Test that we can truncate a file.")                \
@@ -564,6 +565,32 @@ err:
     free(rbuf);
     free(wbuf);
     return success;
+}
+
+// A flat filesystem's contract as seen through the fs layer: directory-shaped
+// requests are ERR_NOT_SUPPORTED, missing names are ERR_NOT_FOUND, and the
+// mount root is the one openable directory.
+static bool test_flat_semantics(const char *dev_name) {
+    filehandle *h;
+    if (fs_make_dir(MNT_PATH "/sub") != ERR_NOT_SUPPORTED) {
+        return false;
+    }
+    if (fs_create_file(MNT_PATH "/sub/file", &h, 0) != ERR_NOT_SUPPORTED) {
+        return false;
+    }
+
+    if (fs_open_file(MNT_PATH "/nope", &h) != ERR_NOT_FOUND) {
+        return false;
+    }
+    dirhandle *dh;
+    if (fs_open_dir(MNT_PATH "/nope", &dh) != ERR_NOT_FOUND) {
+        return false;
+    }
+
+    if (fs_open_dir(MNT_PATH, &dh) != NO_ERROR) {
+        return false;
+    }
+    return fs_close_dir(dh) == NO_ERROR;
 }
 
 static bool test_rm_active_dirent(const char *dev_name) {

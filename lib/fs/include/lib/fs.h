@@ -118,6 +118,10 @@ struct fs_vnode {
 status_t fs_vnode_create(uint64_t id, enum fs_vnode_type type, void *priv,
                          struct fs_vnode **out) __NONNULL((4));
 
+/* Destroy a vnode that was never handed back to the layer (error unwinding
+ * inside a filesystem op). Invalid on a vnode the layer has seen. */
+void fs_vnode_destroy(struct fs_vnode *vn) __NONNULL();
+
 struct fs_api {
     // volume ops
     status_t (*format)(struct bdev *, const void *args);

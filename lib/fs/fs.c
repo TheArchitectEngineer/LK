@@ -152,6 +152,11 @@ status_t fs_vnode_create(uint64_t id, enum fs_vnode_type type, void *priv,
     return NO_ERROR;
 }
 
+void fs_vnode_destroy(struct fs_vnode *vn) {
+    DEBUG_ASSERT(vn->mount == NULL);
+    free(vn);
+}
+
 // Take ownership of a vnode freshly returned by the filesystem: bind it to
 // its mount and deduplicate by id, so two lookups of one object always yield
 // one vnode. Returns the canonical vnode carrying the caller's reference.
