@@ -91,7 +91,8 @@ struct dirhandle {
 
 // protects the node tree, all refcounts, the mount list, the vnode lists and
 // the open scaffold dir cookies; held across the namespace ops of the vnode
-// interface (lookup/create/mkdir/unlink/rmdir), but never across file I/O
+// interface (lookup/create/mkdir/unlink/rmdir, and readlink, which the walk
+// calls to follow a symlink), but never across file I/O
 static mutex_t fs_lock = MUTEX_INITIAL_VALUE(fs_lock);
 static struct list_node mounts = LIST_INITIAL_VALUE(mounts);
 
