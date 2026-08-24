@@ -233,13 +233,13 @@ static bool test_ext2_symlinks(void) {
 
     ASSERT_TRUE(mount_test_fs(), "mount");
 
-    // relative link, through the directory's real .. entry
+    // a relative link resolves against the directory holding it. ".." is
+    // flattened lexically by the layer and never reaches the driver.
     EXPECT_TRUE(check_file_content(test_path "/links/rel_link", hello_content, HELLO_LEN),
                 "relative symlink");
-    // absolute link, resolved against the filesystem root
-    EXPECT_TRUE(check_file_content(test_path "/links/abs_link", deep_content, DEEP_LEN),
-                "absolute symlink");
-    // a chain inside the walker's nesting limit
+    EXPECT_TRUE(check_file_content(test_path "/links/rel_deep", deep_content, DEEP_LEN),
+                "multi component relative symlink");
+    // a chain inside the layer's symlink depth limit
     EXPECT_TRUE(check_file_content(test_path "/links/chain1", hello_content, HELLO_LEN),
                 "symlink chain");
     // a target longer than 60 bytes is stored in data blocks, not the inode
@@ -250,10 +250,55 @@ static bool test_ext2_symlinks(void) {
     filehandle *h;
     EXPECT_EQ(ERR_RECURSE_TOO_DEEP, fs_open_file(test_path "/links/loop1", &h), "symlink loop");
 
-    // and a symlink works as an intermediate path component too
-    EXPECT_TRUE(check_file_content(test_path "/links/rel_link", hello_content, HELLO_LEN),
-                "symlink reread");
+    // a symlink to a directory can be walked through as an intermediate
+    // component, not just resolved as the last one
+    EXPECT_TRUE(check_file_content(test_path "/links/dirlink/dir2/dir3/deep.txt",
+                                   deep_content, DEEP_LEN),
+                "symlink as an intermediate component");
+    // and a directory symlink names a directory
+    dirhandle *dh = NULL;
+    EXPECT_EQ(NO_ERROR, fs_open_dir(test_path "/links/dirlink", &dh), "opendir through a symlink");
+    if (dh) {
+        EXPECT_EQ(NO_ERROR, fs_close_dir(dh), "closedir");
+    }
 
+    EXPECT_EQ(NO_ERROR, fs_unmount(test_path), "unmount");
+
+    END_TEST;
+}
+
+// The fs layer resolves an absolute symlink target against the mount
+// namespace root rather than the filesystem's own root, which is a change
+// from the driver's old private walker. abs_link points at
+// "/dir1/dir2/dir3/deep.txt": a real path inside the image, but not one that
+// names anything while the image is mounted at /e2.
+static const char cross_content[] = "from the other filesystem\n";
+#define CROSS_LEN (sizeof(cross_content) - 1)
+
+static bool test_ext2_absolute_symlink(void) {
+    BEGIN_TEST;
+    SKIP_TEST_IF_NO_DEVICE();
+
+    ASSERT_TRUE(mount_test_fs(), "mount");
+
+    filehandle *h;
+    EXPECT_EQ(ERR_NOT_FOUND, fs_open_file(test_path "/links/abs_link", &h),
+              "absolute target does not resolve inside the mount");
+
+    // build that path out of a second filesystem: if the link now resolves,
+    // it left the ext2 mount entirely
+    ASSERT_EQ(NO_ERROR, fs_mount("/dir1", "memfs", NULL, FS_MOUNT_OPTION_NONE), "mount memfs");
+    EXPECT_EQ(NO_ERROR, fs_make_dir("/dir1/dir2"), "mkdir dir2");
+    EXPECT_EQ(NO_ERROR, fs_make_dir("/dir1/dir2/dir3"), "mkdir dir3");
+
+    ASSERT_EQ(NO_ERROR, fs_create_file("/dir1/dir2/dir3/deep.txt", &h, CROSS_LEN), "create target");
+    EXPECT_EQ((ssize_t)CROSS_LEN, fs_write_file(h, cross_content, 0, CROSS_LEN), "write target");
+    EXPECT_EQ(NO_ERROR, fs_close_file(h), "close target");
+
+    EXPECT_TRUE(check_file_content(test_path "/links/abs_link", cross_content, CROSS_LEN),
+                "absolute symlink crosses into the other mount");
+
+    EXPECT_EQ(NO_ERROR, fs_unmount("/dir1"), "unmount memfs");
     EXPECT_EQ(NO_ERROR, fs_unmount(test_path), "unmount");
 
     END_TEST;
@@ -279,10 +324,107 @@ static bool test_ext2_dirs(void) {
     // walking through a file as if it were a directory fails
     EXPECT_GT(0, fs_open_file(test_path "/hello.txt/sub", &h), "file as dir component");
 
-    // the driver has no readdir yet, so directory enumeration is refused.
-    // when it grows one, flip this to a real listing test.
+    // opening a file as a directory fails too
     dirhandle *dh;
-    EXPECT_EQ(ERR_NOT_SUPPORTED, fs_open_dir(test_path "/dir1", &dh), "opendir unsupported");
+    EXPECT_EQ(ERR_NOT_DIR, fs_open_dir(test_path "/hello.txt", &dh), "opendir on a file");
+
+    EXPECT_EQ(NO_ERROR, fs_unmount(test_path), "unmount");
+
+    END_TEST;
+}
+
+// Read a directory to exhaustion, checking that every expected name turns up
+// exactly once and that "." and ".." never do.
+static bool check_dir_listing(const char *path, const char *const *expected, size_t count) {
+    BEGIN_TEST;
+
+    dirhandle *dh;
+    ASSERT_EQ(NO_ERROR, fs_open_dir(path, &dh), path);
+
+    bool *seen = malloc(count * sizeof(bool));
+    if (!seen) {
+        fs_close_dir(dh);
+        ASSERT_NONNULL(NULL, "seen buffer");
+    }
+    memset(seen, 0, count * sizeof(bool));
+
+    struct dirent ent;
+    status_t err;
+    int entries = 0;
+    // the test images hold nothing near this many entries in one directory,
+    // so the bound only exists to stop a broken cursor from looping forever
+    while (entries < 256 && (err = fs_read_dir(dh, &ent)) == NO_ERROR) {
+        entries++;
+        if (!strcmp(ent.name, ".") || !strcmp(ent.name, "..")) {
+            unittest_printf("\n        readdir returned '%s' ", ent.name);
+            EXPECT_TRUE(false, "dot entry listed");
+            continue;
+        }
+        for (size_t i = 0; i < count; i++) {
+            if (!strcmp(ent.name, expected[i])) {
+                EXPECT_FALSE(seen[i], expected[i]);
+                seen[i] = true;
+            }
+        }
+    }
+    EXPECT_EQ(ERR_NOT_FOUND, err, "end of directory");
+
+    // and it stays at the end
+    EXPECT_EQ(ERR_NOT_FOUND, fs_read_dir(dh, &ent), "stable end of directory");
+
+    for (size_t i = 0; i < count; i++) {
+        if (!seen[i]) {
+            unittest_printf("\n        missing entry '%s' ", expected[i]);
+            EXPECT_TRUE(false, "entry not listed");
+        }
+    }
+
+    free(seen);
+    EXPECT_EQ(NO_ERROR, fs_close_dir(dh), "closedir");
+
+    END_TEST;
+}
+
+static bool test_ext2_readdir(void) {
+    BEGIN_TEST;
+    SKIP_TEST_IF_NO_DEVICE();
+
+    ASSERT_TRUE(mount_test_fs(), "mount");
+
+    // the root directory, which the driver's old private walker could not
+    // reach through any api at all
+    static const char *const root_entries[] = {
+        "lost+found", "hello.txt", "dir1", "links",
+        "pattern_small.bin", "pattern_large.bin",
+        "a_directory_with_a_name_long_enough_to_defeat_inline_symlinks",
+    };
+    EXPECT_TRUE(check_dir_listing(test_path, root_entries, countof(root_entries)),
+                "root listing");
+
+    static const char *const links_entries[] = {
+        "rel_link", "rel_deep", "abs_link", "dirlink",
+        "chain1", "chain2", "chain3", "loop1", "loop2", "long_link",
+    };
+    EXPECT_TRUE(check_dir_listing(test_path "/links", links_entries, countof(links_entries)),
+                "links listing");
+
+    static const char *const dir1_entries[] = { "dir2" };
+    EXPECT_TRUE(check_dir_listing(test_path "/dir1", dir1_entries, countof(dir1_entries)),
+                "nested listing");
+
+    // two cursors over one directory are independent
+    dirhandle *a, *b;
+    ASSERT_EQ(NO_ERROR, fs_open_dir(test_path "/dir1/dir2/dir3", &a), "opendir a");
+    ASSERT_EQ(NO_ERROR, fs_open_dir(test_path "/dir1/dir2/dir3", &b), "opendir b");
+    struct dirent ea, eb;
+    EXPECT_EQ(NO_ERROR, fs_read_dir(a, &ea), "read a");
+    EXPECT_EQ(NO_ERROR, fs_read_dir(b, &eb), "read b");
+    EXPECT_EQ(0, strcmp(ea.name, "deep.txt"), "a first entry");
+    EXPECT_EQ(0, strcmp(eb.name, "deep.txt"), "b first entry");
+    EXPECT_EQ(ERR_NOT_FOUND, fs_read_dir(a, &ea), "a exhausted");
+    EXPECT_EQ(NO_ERROR, fs_close_dir(a), "close a");
+    EXPECT_EQ(ERR_NOT_FOUND, fs_read_dir(b, &eb), "b exhausted");
+    EXPECT_EQ(NO_ERROR, fs_close_dir(b), "close b");
 
     EXPECT_EQ(NO_ERROR, fs_unmount(test_path), "unmount");
 
@@ -318,6 +460,8 @@ RUN_TEST(test_ext2_mount)
 RUN_TEST(test_ext2_read_files)
 RUN_TEST(test_ext2_pattern_files)
 RUN_TEST(test_ext2_symlinks)
+RUN_TEST(test_ext2_absolute_symlink)
 RUN_TEST(test_ext2_dirs)
+RUN_TEST(test_ext2_readdir)
 RUN_TEST(test_ext2_readonly_ops)
 END_TEST_CASE(ext2_tests)

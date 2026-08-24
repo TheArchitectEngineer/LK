@@ -96,19 +96,28 @@ def build_tree(root):
 
     links = os.path.join(root, 'links')
     os.makedirs(links)
-    # relative, through the real .. dirent
+    # relative, one level up
     os.symlink('../hello.txt', os.path.join(links, 'rel_link'))
-    # absolute, which resolves against the filesystem root
+    # relative, several components deep
+    os.symlink('../dir1/dir2/dir3/deep.txt', os.path.join(links, 'rel_deep'))
+    # absolute. The fs layer resolves these against the mount namespace root
+    # rather than the filesystem's own root, so this one names nothing unless
+    # the namespace happens to have a /dir1/dir2/dir3/deep.txt of its own --
+    # which is exactly what the guest test arranges.
     os.symlink('/dir1/dir2/dir3/deep.txt', os.path.join(links, 'abs_link'))
-    # a chain that stays inside the walker's nesting limit of 4
+    # a link to a directory, so it can be walked through as an intermediate
+    # path component rather than resolved as the last one
+    os.symlink('../dir1', os.path.join(links, 'dirlink'))
+    # a chain that stays inside the layer's symlink depth limit
     os.symlink('chain2', os.path.join(links, 'chain1'))
     os.symlink('chain3', os.path.join(links, 'chain2'))
     os.symlink('../hello.txt', os.path.join(links, 'chain3'))
     # a loop, which must fail cleanly rather than hang
     os.symlink('loop2', os.path.join(links, 'loop1'))
     os.symlink('loop1', os.path.join(links, 'loop2'))
-    # a target long enough (>60 bytes) to be stored in blocks, not the inode
-    target = f'/{LONG_DIR}/target.txt'
+    # a target long enough (>60 bytes) to be stored in blocks rather than
+    # inline in the inode. Relative, so it resolves inside the mount.
+    target = f'../{LONG_DIR}/target.txt'
     assert len(target) > 60, target
     os.symlink(target, os.path.join(links, 'long_link'))
 
@@ -145,8 +154,7 @@ def build_image(name, spec, out_dir, quiet, force):
 
     # -n: verify only. A freshly built image that fsck complains about is a
     # tooling problem, better caught here than as guest test failures.
-    run(['e2fsck', '-fn', img_path], quiet,
-        stdout=subprocess.DEVNULL if quiet else None)
+    run(['e2fsck', '-fn', img_path], quiet)
 
 
 def main():

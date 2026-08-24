@@ -1,10 +1,11 @@
 # lib/fs: moving the path walk into the fs layer
 
-Status: in progress, 2026-08-24. Phases 0-2 are implemented on this branch:
+Status: in progress, 2026-08-24. Phases 0-3 are implemented on this branch:
 the pre-fixes and test expansion of §6 Phase 0, the node tree / vnode
-interface / walk of Phase 1, and the memfs conversion plus the
-FS_NODE_CACHE_SIZE LRU of Phase 2. Sections below describe the design as
-proposed; deviations that emerged during implementation:
+interface / walk of Phase 1, the memfs conversion plus the
+FS_NODE_CACHE_SIZE LRU of Phase 2, and the ext2 conversion of Phase 3.
+Sections below describe the design as proposed; deviations that emerged
+during implementation:
 
 - the dirhandle holds the directory's *vnode* (plus the fs cursor), not the
   fs_node; nothing pins node chains for open files or dirs, the vnode does
@@ -14,6 +15,13 @@ proposed; deviations that emerged during implementation:
   a mount has no separate root node; `mounted->root` is a vnode
 - the node cache is runtime-resizable (fs_set_node_cache_size) on top of the
   FS_NODE_CACHE_SIZE build default
+- readdir does not report "." or "..": the layer flattens both lexically and
+  no filesystem in the tree lists them, so this is the cross-filesystem `ls`
+  contract, not an ext2 detail
+- the symlink depth limit is the layer's FS_MAX_SYMLINK_DEPTH (8), replacing
+  ext2's private limit of 4. A spliced path must fit FS_MAX_PATH_LEN (128),
+  where the old ext2 walker allowed targets up to 512 bytes; over that the
+  walk returns ERR_NOT_ENOUGH_BUFFER
 
 Phases 3 (ext2), 4 (spifs), 5 (FAT), 6 (9p) and 7 (cleanup) remain.
 

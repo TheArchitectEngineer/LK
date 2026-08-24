@@ -123,8 +123,8 @@ error:
     return err;
 }
 
-/* translate a file block to a physical block */
-static blocknum_t file_block_to_fs_block(ext2_t *ext2, struct ext2_inode *inode, uint fileblock) {
+/* translate a file block to a physical block; 0 means a hole */
+blocknum_t ext2_file_block_to_fs_block(ext2_t *ext2, struct ext2_inode *inode, uint fileblock) {
     int err;
     blocknum_t block;
 
@@ -193,7 +193,7 @@ ssize_t ext2_read_inode(ext2_t *ext2, struct ext2_inode *inode, void *_buf, off_
         /* calculate the block and copy the partial range straight out of the
          * block cache: a block sized bounce buffer is too big for the stack
          * (a whole page at 4K block size) and not worth an allocation */
-        blocknum_t phys_block = file_block_to_fs_block(ext2, inode, file_block);
+        blocknum_t phys_block = ext2_file_block_to_fs_block(ext2, inode, file_block);
         if (phys_block == 0) {
             memset(buf, 0, tocopy);
         } else {
@@ -216,7 +216,7 @@ ssize_t ext2_read_inode(ext2_t *ext2, struct ext2_inode *inode, void *_buf, off_
     /* handle middle blocks */
     while (len >= EXT2_BLOCK_SIZE(ext2->sb)) {
         /* calculate the block and read it */
-        blocknum_t phys_block = file_block_to_fs_block(ext2, inode, file_block);
+        blocknum_t phys_block = ext2_file_block_to_fs_block(ext2, inode, file_block);
         if (phys_block == 0) {
             memset(buf, 0, EXT2_BLOCK_SIZE(ext2->sb));
         } else {
@@ -234,7 +234,7 @@ ssize_t ext2_read_inode(ext2_t *ext2, struct ext2_inode *inode, void *_buf, off_
     if (len > 0) {
         /* calculate the block and copy the head of it out of the block cache,
          * same as the partial first block above */
-        blocknum_t phys_block = file_block_to_fs_block(ext2, inode, file_block);
+        blocknum_t phys_block = ext2_file_block_to_fs_block(ext2, inode, file_block);
         if (phys_block == 0) {
             memset(buf, 0, len);
         } else {

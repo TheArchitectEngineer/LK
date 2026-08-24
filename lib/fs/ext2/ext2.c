@@ -92,7 +92,8 @@ static void endian_swap_group_desc(struct ext2_group_desc *gd) {
     LE16SWAP(gd->bg_used_dirs_count);
 }
 
-status_t ext2_mount(bdev_t *dev, fscookie **cookie, enum fs_mount_options options) {
+status_t ext2_mount(bdev_t *dev, enum fs_mount_options options, fscookie **cookie,
+                    struct fs_vnode **root) {
     /* the filesystem is intrinsically read-only, so that option is always satisfied */
     if ((options & ~FS_MOUNT_OPTION_READ_ONLY) != 0) {
         return ERR_INVALID_ARGS;
@@ -185,8 +186,8 @@ status_t ext2_mount(bdev_t *dev, fscookie **cookie, enum fs_mount_options option
         goto err;
     }
 
-    /* load the first inode */
-    err = ext2_load_inode(ext2, EXT2_ROOT_INO, &ext2->root_inode);
+    /* build the root vnode, which also validates that the root inode reads */
+    err = ext2_create_vnode(ext2, EXT2_ROOT_INO, root);
     if (err < 0) {
         goto err;
     }
@@ -265,13 +266,59 @@ int ext2_load_inode(ext2_t *ext2, inodenum_t num, struct ext2_inode *inode) {
     return 0;
 }
 
-static const struct fs_legacy_api ext2_api = {
+/* Wrap an inode number in a vnode for the layer. The filesystem hands back a
+ * fresh one every time; the layer deduplicates by the inode number it carries
+ * as the vnode id, so hard links to one object share a single vnode. */
+status_t ext2_create_vnode(ext2_t *ext2, inodenum_t inum, struct fs_vnode **out) {
+    ext2_vnode_t *v = malloc(sizeof(ext2_vnode_t));
+    if (!v) {
+        return ERR_NO_MEMORY;
+    }
+
+    v->ext2 = ext2;
+    v->inum = inum;
+
+    int err = ext2_load_inode(ext2, inum, &v->inode);
+    if (err < 0) {
+        free(v);
+        return err;
+    }
+
+    enum fs_vnode_type type;
+    if (S_ISDIR(v->inode.i_mode)) {
+        type = FS_VNODE_DIR;
+    } else if (S_ISLNK(v->inode.i_mode)) {
+        type = FS_VNODE_SYMLINK;
+    } else {
+        /* anything else -- regular files, and the special files the driver
+         * cannot do anything with either way */
+        type = FS_VNODE_FILE;
+    }
+
+    status_t status = fs_vnode_create(inum, type, v, out);
+    if (status < 0) {
+        free(v);
+        return status;
+    }
+
+    return NO_ERROR;
+}
+
+void ext2_release(struct fs_vnode *vn) {
+    free(vn->priv);
+}
+
+static const struct fs_api ext2_api = {
     .mount = ext2_mount,
     .unmount = ext2_unmount,
-    .open = ext2_open_file,
-    .stat = ext2_stat_file,
-    .read = ext2_read_file,
-    .close = ext2_close_file,
+    .lookup = ext2_lookup,
+    .readlink = ext2_readlink,
+    .release = ext2_release,
+    .read = ext2_read,
+    .stat = ext2_stat,
+    .opendir = ext2_opendir,
+    .readdir = ext2_readdir,
+    .closedir = ext2_closedir,
 };
 
-STATIC_FS_IMPL_LEGACY(ext2, &ext2_api);
+STATIC_FS_IMPL(ext2, &ext2_api);
