@@ -364,6 +364,64 @@ bool test_fat_format_rejects_impossible_geometry() {
     END_TEST;
 }
 
+// create/mkdir/remove/rmdir used to copy the path into 65 byte local buffers
+// (FS_MAX_FILE_LEN + 1 rather than FS_MAX_PATH_LEN), so any path longer than
+// that was silently truncated and the operation landed on the wrong name.
+// Lookup walks the original string and never truncated, which is what made the
+// bug visible: a created name could not be opened back.
+bool test_fat_long_paths() {
+    BEGIN_TEST;
+
+    fat_test::geometry g = {"longpath", 12, 512, 1, 1000};
+    ram_volume vol;
+    const auto args = fat_test::format_args_for(g);
+    status_t err = vol.create(kDeviceName, kMountPath, fat_test::volume_size_for(g), args);
+    if (err == ERR_NO_MEMORY) {
+        unittest_printf("\n        skipping: volume would not allocate ");
+        END_TEST;
+    }
+    ASSERT_EQ(NO_ERROR, err);
+
+    // a directory whose full path exceeds the old 64 byte limit
+    char dirpath[FS_MAX_PATH_LEN];
+    int len = snprintf(dirpath, sizeof(dirpath), "%s/", vol.path());
+    for (int i = 0; i < 60; i++) {
+        dirpath[len++] = 'd';
+    }
+    dirpath[len] = 0;
+    ASSERT_GT((size_t)len, (size_t)FS_MAX_FILE_LEN + 1);
+
+    ASSERT_EQ(NO_ERROR, fs_make_dir(dirpath));
+
+    // the full, untruncated name must be present
+    dirhandle *dh = nullptr;
+    ASSERT_EQ(NO_ERROR, fs_open_dir(dirpath, &dh));
+    ASSERT_EQ(NO_ERROR, fs_close_dir(dh));
+
+    // and a file created inside it via an even longer path must round trip
+    char filepath[FS_MAX_PATH_LEN];
+    snprintf(filepath, sizeof(filepath), "%s/%s", dirpath,
+             "file_with_a_long_name_of_its_own.txt");
+
+    filehandle *fh = nullptr;
+    ASSERT_EQ(NO_ERROR, fs_create_file(filepath, &fh, 0));
+    ASSERT_EQ(NO_ERROR, fs_close_file(fh));
+    EXPECT_TRUE(write_and_verify(filepath, 0x5555, 0, 256));
+
+    ASSERT_EQ(NO_ERROR, vol.remount());
+    EXPECT_TRUE(verify_file_contents(filepath, 0x5555, 0, 256, 256));
+
+    // unlink through the long paths as well
+    ASSERT_EQ(NO_ERROR, fs_remove_file(filepath));
+    fh = nullptr;
+    EXPECT_EQ(ERR_NOT_FOUND, fs_open_file(filepath, &fh));
+    ASSERT_EQ(NO_ERROR, fs_remove_dir(dirpath));
+    dh = nullptr;
+    EXPECT_NE(NO_ERROR, fs_open_dir(dirpath, &dh));
+
+    END_TEST;
+}
+
 // Mounting a corrupt volume must fail cleanly. Before the device size check went
 // in, a BPB claiming more sectors than the device holds sent every subsequent
 // cluster computation off the end of it. These are cheap to construct on a RAM
@@ -468,6 +526,7 @@ bool test_fat_mount_rejects_malformed() {
 BEGIN_TEST_CASE(fat_ram)
 RUN_TEST(test_fat_ram_geometries)
 RUN_TEST(test_fat_ram_format_roundtrip)
+RUN_TEST(test_fat_long_paths)
 RUN_TEST(test_fat_format_rejects_impossible_geometry)
 RUN_TEST(test_fat_mount_rejects_malformed)
 END_TEST_CASE(fat_ram)

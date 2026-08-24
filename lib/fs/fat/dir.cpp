@@ -964,10 +964,10 @@ bcache_block_ref open_dirent_block(fat_fs *fat, const dir_entry_location &loc) {
 }
 
 status_t resolve_parent_cluster_and_last_element(fat_fs *fat, const char *path,
-                                                 char local_path[FS_MAX_FILE_LEN + 1],
+                                                 char local_path[FS_MAX_PATH_LEN],
                                                  uint32_t *parent_cluster,
                                                  const char **last_element) {
-    strlcpy(local_path, path, FS_MAX_FILE_LEN + 1);
+    strlcpy(local_path, path, FS_MAX_PATH_LEN);
 
     const char *leading_path;
     split_path(local_path, &leading_path, last_element);
@@ -1079,7 +1079,7 @@ status_t fat_dir::mkdir(fscookie *cookie, const char *path) {
 
     AutoLock guard(fat->lock);
 
-    char local_path[FS_MAX_FILE_LEN + 1];
+    char local_path[FS_MAX_PATH_LEN];
     strlcpy(local_path, path, sizeof(local_path));
 
     const char *leading_path;
@@ -1168,7 +1168,7 @@ status_t fat_dir::remove(fscookie *cookie, const char *path) {
 
     AutoLock guard(fat->lock);
 
-    char local_path[FS_MAX_FILE_LEN + 1];
+    char local_path[FS_MAX_PATH_LEN];
     uint32_t parent_cluster;
     const char *last_element;
     status_t err = resolve_parent_cluster_and_last_element(fat, path, local_path,
@@ -1237,7 +1237,7 @@ status_t fat_dir::rmdir(fscookie *cookie, const char *path) {
 
     AutoLock guard(fat->lock);
 
-    char local_path[FS_MAX_FILE_LEN + 1];
+    char local_path[FS_MAX_PATH_LEN];
     uint32_t parent_cluster;
     const char *last_element;
     status_t err = resolve_parent_cluster_and_last_element(fat, path, local_path,
@@ -1304,8 +1304,8 @@ status_t fat_dir_allocate(fat_fs *fat, const char *path, const fat_attribute att
     DEBUG_ASSERT(fat->lock.is_held());
 
     // trim the last segment off the path, splitting into stuff leading up to the last segment and the last segment
-    char local_path[FS_MAX_FILE_LEN + 1];
-    strlcpy(local_path, path, FS_MAX_FILE_LEN);
+    char local_path[FS_MAX_PATH_LEN];
+    strlcpy(local_path, path, sizeof(local_path));
 
     const char *leading_path;
     const char *last_element;
