@@ -14,26 +14,42 @@
 
 #define LOCAL_TRACE 0
 
+/* The walk recurses through symlinks, and the default thread stack is a
+ * single page on some architectures, so no block or link sized buffer may
+ * live in a walk stack frame. Everything the walk needs is gathered in one
+ * scratch structure, allocated once per lookup -- never per component or per
+ * symlink. The recursion limit bounds the per-level link target storage. */
+#define EXT2_WALK_MAX_RECURSE 4
+#define EXT2_WALK_MAX_LINK    512
+
+struct ext2_walk_scratch {
+    char path[EXT2_WALK_MAX_LINK];                          // mutable copy of the caller's path
+    char link[EXT2_WALK_MAX_RECURSE][EXT2_WALK_MAX_LINK];   // one target buffer per nesting level
+    uint8_t dirblock[];                                     // one block, for the dirent scan
+};
+
 /* read in the dir, look for the entry */
-static int ext2_dir_lookup(ext2_t *ext2, struct ext2_inode *dir_inode, const char *name, inodenum_t *inum) {
+static int ext2_dir_lookup(ext2_t *ext2, struct ext2_walk_scratch *scratch,
+                           struct ext2_inode *dir_inode, const char *name, inodenum_t *inum) {
     uint file_blocknum;
     int err;
-    uint8_t *buf;
+    uint8_t *buf = scratch->dirblock;
     size_t namelen = strlen(name);
 
     if (!S_ISDIR(dir_inode->i_mode)) {
         return ERR_NOT_DIR;
     }
 
-    buf = malloc(EXT2_BLOCK_SIZE(ext2->sb));
-
     file_blocknum = 0;
     for (;;) {
         /* read in the offset */
         err = ext2_read_inode(ext2, dir_inode, buf, (off_t)file_blocknum * EXT2_BLOCK_SIZE(ext2->sb), EXT2_BLOCK_SIZE(ext2->sb));
-        if (err <= 0) {
-            free(buf);
-            return -1;
+        if (err < 0) {
+            return err;
+        }
+        if (err == 0) {
+            /* the directory has been searched completely */
+            return ERR_NOT_FOUND;
         }
 
         /* walk through the directory entries, looking for the one that matches */
@@ -54,7 +70,6 @@ static int ext2_dir_lookup(ext2_t *ext2, struct ext2_inode *dir_inode, const cha
                 // match
                 *inum = LE32(ent->inode);
                 LTRACEF("match: inode %d\n", *inum);
-                free(buf);
                 return 1;
             }
 
@@ -65,14 +80,14 @@ static int ext2_dir_lookup(ext2_t *ext2, struct ext2_inode *dir_inode, const cha
 
         /* sanity check the directory. 4MB should be enough */
         if (file_blocknum > 1024) {
-            free(buf);
-            return -1;
+            return ERR_TOO_BIG;
         }
     }
 }
 
 /* note, trashes path */
-static int ext2_walk(ext2_t *ext2, char *path, struct ext2_inode *start_inode, inodenum_t *inum, int recurse) {
+static int ext2_walk(ext2_t *ext2, struct ext2_walk_scratch *scratch, char *path,
+                     struct ext2_inode *start_inode, inodenum_t *inum, int recurse) {
     char *ptr;
     struct ext2_inode inode;
     struct ext2_inode dir_inode;
@@ -81,7 +96,7 @@ static int ext2_walk(ext2_t *ext2, char *path, struct ext2_inode *start_inode, i
 
     LTRACEF("path '%s', start_inode %p, inum %p, recurse %d\n", path, start_inode, inum, recurse);
 
-    if (recurse > 4) {
+    if (recurse > EXT2_WALK_MAX_RECURSE) {
         return ERR_RECURSE_TOO_DEEP;
     }
 
@@ -107,7 +122,7 @@ static int ext2_walk(ext2_t *ext2, char *path, struct ext2_inode *start_inode, i
         LTRACEF("component '%s', done %d\n", ptr, done);
 
         /* do the lookup on this component */
-        err = ext2_dir_lookup(ext2, &dir_inode, ptr, inum);
+        err = ext2_dir_lookup(ext2, scratch, &dir_inode, ptr, inum);
         if (err < 0) {
             return err;
         }
@@ -123,11 +138,12 @@ nextcomponent:
 
         /* is it a symlink? */
         if (S_ISLNK(inode.i_mode)) {
-            char link[512];
-
             LTRACEF("hit symlink\n");
 
-            err = ext2_read_link(ext2, &inode, link, sizeof(link));
+            /* this nesting level's link buffer in the walk scratch */
+            char *link = scratch->link[recurse - 1];
+
+            err = ext2_read_link(ext2, &inode, link, EXT2_WALK_MAX_LINK);
             if (err < 0) {
                 return err;
             }
@@ -137,9 +153,9 @@ nextcomponent:
             /* recurse, parsing the link */
             if (link[0] == '/') {
                 /* link starts with '/', so start over again at the rootfs */
-                err = ext2_walk(ext2, link, &ext2->root_inode, inum, recurse + 1);
+                err = ext2_walk(ext2, scratch, link, &ext2->root_inode, inum, recurse + 1);
             } else {
-                err = ext2_walk(ext2, link, &dir_inode, inum, recurse + 1);
+                err = ext2_walk(ext2, scratch, link, &dir_inode, inum, recurse + 1);
             }
 
             LTRACEF("recursive walk returns %d\n", err);
@@ -181,8 +197,19 @@ nextcomponent:
 int ext2_lookup(ext2_t *ext2, const char *_path, inodenum_t *inum) {
     LTRACEF("path '%s', inum %p\n", _path, inum);
 
-    char path[512];
-    strlcpy(path, _path, sizeof(path));
+    /* one allocation for everything the walk needs; see the comment on
+     * struct ext2_walk_scratch */
+    struct ext2_walk_scratch *scratch =
+        malloc(sizeof(*scratch) + EXT2_BLOCK_SIZE(ext2->sb));
+    if (!scratch) {
+        return ERR_NO_MEMORY;
+    }
 
-    return ext2_walk(ext2, path, &ext2->root_inode, inum, 1);
+    strlcpy(scratch->path, _path, sizeof(scratch->path));
+
+    int err = ext2_walk(ext2, scratch, scratch->path, &ext2->root_inode, inum, 1);
+
+    free(scratch);
+
+    return err;
 }
