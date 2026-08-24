@@ -336,15 +336,11 @@ endif
 ifeq ($(call is_warning_flag_supported,-Wnonnull-compare),yes)
 GLOBAL_COMPILEFLAGS += -Wno-nonnull-compare
 endif
-# Ideally we would move this check to arm64/rules.mk, but we can only check
-# for supported warning flags once CC is defined.
-ifeq ($(ARCH),arm64)
-# Clang incorrectly diagnoses msr operations as need a 64-bit operand even if
-# the underlying register is actually 32 bits. Silence this common warning.
-ifeq ($(call is_warning_flag_supported,-Wasm-operand-widths),yes)
-ARCH_COMPILEFLAGS += -Wno-asm-operand-widths
-endif
-endif
+# Note: -Wno-asm-operand-widths used to be added for arm64 here, on the premise
+# that clang was wrong to want a 64-bit operand for msr. It is not wrong: MSR/MRS
+# transfer all 64 bits and only accept an X register, so a 32-bit operand emits
+# an x register whose upper half was never zeroed. ARM64_WRITE_SYSREG casts to
+# uint64_t instead, which fixes the cause rather than hiding it.
 
 ifeq ($(ARCH),riscv)
 # ld.lld does not support linker relaxations yet.
