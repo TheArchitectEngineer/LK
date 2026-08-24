@@ -290,10 +290,16 @@ else
     STRIP ?= $(TOOLCHAIN_PREFIX)strip
 endif
 
-# Detect whether we are using ld.lld. If we don't detect ld.lld, we assume
-# it's ld.bfd. This check can be refined in the future if we need to handle
-# more cases (e.g. ld.gold).
-LINKER_TYPE := $(shell $(LD) -v 2>&1 | grep -q "LLD" && echo lld || echo bfd)
+# Detect whether we are using ld.lld, assuming it is named ld.lld. If we don't
+# detect ld.lld, we assume it's ld.bfd. This check can be refined in the future
+# if we need to handle more cases (e.g. ld.gold).
+#
+# Match on the name rather than the version banner. An 'ld' that is really lld
+# reports "LLD" and would be taken for a usable cross linker even when it is
+# the Mach-O only flavor, as on macOS, enabling flags and code paths that then
+# fail confusingly. LLD is only wanted here when it has been asked for by name
+# (LD=ld.lld), so that is what we look for.
+LINKER_TYPE := $(if $(filter %ld.lld,$(notdir $(firstword $(LD)))),lld,bfd)
 $(info LINKER_TYPE=$(LINKER_TYPE))
 # Detect whether we are compiling with GCC or Clang
 COMPILER_TYPE := $(shell $(CC) -v 2>&1 | grep -q "clang version" && echo clang || echo gcc)
