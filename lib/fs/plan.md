@@ -1,6 +1,21 @@
 # lib/fs: moving the path walk into the fs layer
 
-Status: proposal, 2026-08-22. Nothing here is implemented.
+Status: in progress, 2026-08-24. Phases 0-2 are implemented on this branch:
+the pre-fixes and test expansion of §6 Phase 0, the node tree / vnode
+interface / walk of Phase 1, and the memfs conversion plus the
+FS_NODE_CACHE_SIZE LRU of Phase 2. Sections below describe the design as
+proposed; deviations that emerged during implementation:
+
+- the dirhandle holds the directory's *vnode* (plus the fs cursor), not the
+  fs_node; nothing pins node chains for open files or dirs, the vnode does
+- unlink evicts a cached name node rather than detaching it live; the layer's
+  ERR_BUSY check makes detach-while-open unreachable in the first version
+- vnode-interface components attach as children of the mount point node, so
+  a mount has no separate root node; `mounted->root` is a vnode
+- the node cache is runtime-resizable (fs_set_node_cache_size) on top of the
+  FS_NODE_CACHE_SIZE build default
+
+Phases 3 (ext2), 4 (spifs), 5 (FAT), 6 (9p) and 7 (cleanup) remain.
 
 ## 1. Problem and constraints
 
