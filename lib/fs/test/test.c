@@ -141,6 +141,43 @@ static bool test_stdio_fs(void) {
     END_TEST;
 }
 
+#define BUSY_MNT  "/fs_busy_test"
+#define BUSY_FILE BUSY_MNT "/file"
+
+static void test_remove_while_open_teardown(void *ptr) {
+    fs_remove_file(BUSY_FILE);
+    fs_unmount(BUSY_MNT);
+}
+
+static bool test_remove_while_open(void) {
+    __attribute__((cleanup(test_remove_while_open_teardown))) BEGIN_TEST;
+
+    ASSERT_EQ(NO_ERROR, fs_mount(BUSY_MNT, "memfs", NULL, FS_MOUNT_OPTION_NONE), "mount");
+
+    filehandle *h;
+    ASSERT_EQ(NO_ERROR, fs_create_file(BUSY_FILE, &h, 16), "create");
+
+    // removing a file with an open handle must be refused, not freed underneath it
+    EXPECT_EQ(ERR_BUSY, fs_remove_file(BUSY_FILE), "remove while open");
+
+    // the handle must still be usable afterwards
+    char buf[16];
+    EXPECT_EQ(16, fs_read_file(h, buf, 0, sizeof(buf)), "read after failed remove");
+
+    // a second open of the same file holds it busy on its own
+    filehandle *h2;
+    ASSERT_EQ(NO_ERROR, fs_open_file(BUSY_FILE, &h2), "second open");
+    EXPECT_EQ(NO_ERROR, fs_close_file(h), "close first handle");
+    EXPECT_EQ(ERR_BUSY, fs_remove_file(BUSY_FILE), "remove with second handle open");
+    EXPECT_EQ(NO_ERROR, fs_close_file(h2), "close second handle");
+
+    // with every handle closed the remove goes through
+    EXPECT_EQ(NO_ERROR, fs_remove_file(BUSY_FILE), "remove after close");
+    EXPECT_EQ(ERR_NOT_FOUND, fs_open_file(BUSY_FILE, &h), "open after remove");
+
+    END_TEST;
+}
+
 static void test_rootfs_teardown(void *ptr) {
     fs_unmount("/tmp");
     fs_unmount("/data");
@@ -242,6 +279,7 @@ static bool test_rootfs_live_iter(void) {
 BEGIN_TEST_CASE(fs_tests);
 RUN_TEST(test_path_normalize);
 RUN_TEST(test_stdio_fs);
+RUN_TEST(test_remove_while_open);
 RUN_TEST(test_rootfs);
 RUN_TEST(test_rootfs_live_iter);
 END_TEST_CASE(fs_tests);

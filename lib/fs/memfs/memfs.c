@@ -6,6 +6,7 @@
  * https://opensource.org/licenses/MIT
  */
 
+#include <assert.h>
 #include <kernel/mutex.h>
 #include <lib/fs.h>
 #include <lk/debug.h>
@@ -28,6 +29,9 @@ typedef struct {
 typedef struct {
     struct list_node node;
     memfs_t *fs;
+
+    // number of open filecookies referring to this file
+    int open_count;
 
     // name
     char *name;
@@ -158,6 +162,7 @@ static status_t memfs_create(fscookie *cookie, const char *name, filecookie **fc
 
     // fill in some metadata and stuff it in the file list
     file->fs = mem;
+    file->open_count = 1; // the cookie handed back counts as an open
 
     list_add_tail(&mem->files, &file->node);
 
@@ -181,6 +186,9 @@ static status_t memfs_open(fscookie *cookie, const char *name, filecookie **fcoo
 
     mutex_acquire(&mem->lock);
     memfs_file_t *file = find_file(mem, name);
+    if (file) {
+        file->open_count++;
+    }
     mutex_release(&mem->lock);
 
     if (!file) {
@@ -202,6 +210,11 @@ static status_t memfs_remove(fscookie *cookie, const char *name) {
 
     mutex_acquire(&mem->lock);
     memfs_file_t *file = find_file(mem, name);
+    if (file && file->open_count > 0) {
+        // refuse to pull the data out from under an open filehandle
+        mutex_release(&mem->lock);
+        return ERR_BUSY;
+    }
     if (file) {
         list_delete(&file->node);
     }
@@ -211,7 +224,6 @@ static status_t memfs_remove(fscookie *cookie, const char *name) {
         return ERR_NOT_FOUND;
     }
 
-    // XXX make sure there are no open file handles
     free_file(file);
 
     return NO_ERROR;
@@ -221,6 +233,11 @@ static status_t memfs_close(filecookie *fcookie) {
     memfs_file_t *file = (memfs_file_t *)fcookie;
 
     LTRACEF("cookie %p name '%s'\n", fcookie, file->name);
+
+    mutex_acquire(&file->fs->lock);
+    DEBUG_ASSERT(file->open_count > 0);
+    file->open_count--;
+    mutex_release(&file->fs->lock);
 
     return NO_ERROR;
 }
