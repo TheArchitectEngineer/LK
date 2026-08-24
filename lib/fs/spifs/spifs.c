@@ -6,6 +6,7 @@
  * https://opensource.org/licenses/MIT
  */
 
+#include <assert.h>
 #include <lk/debug.h>
 #include <lk/err.h>
 #include <lk/pow2.h>
@@ -88,6 +89,7 @@ typedef struct {
 typedef struct {
     struct list_node node;
     spifs_t *fs_handle;
+    int open_count; // number of open filecookies referring to this file
     toc_file_t metadata;
 } spifs_file_t;
 
@@ -665,6 +667,7 @@ static status_t spifs_mount(bdev_t *dev, fscookie **cookie, enum fs_mount_option
         memcpy(&file->metadata, file_entry, SPIFS_ENTRY_LENGTH);
 
         file->fs_handle = spifs;
+        file->open_count = 0;
 
         list_add_tail(&spifs->files, &file->node);
     }
@@ -769,6 +772,7 @@ static status_t spifs_create(fscookie *cookie, const char *name, filecookie **fc
     }
 
     file->fs_handle = spifs;
+    file->open_count = 1; // the cookie handed back counts as an open
     file->metadata.page_idx = open_run;
     file->metadata.length = len;
     file->metadata.capacity = capacity;
@@ -819,6 +823,9 @@ static status_t spifs_open(fscookie *cookie, const char *name, filecookie **fcoo
     mutex_acquire(&spifs->lock);
 
     spifs_file_t *file = find_file(spifs, name);
+    if (file) {
+        file->open_count++;
+    }
 
     mutex_release(&spifs->lock);
 
@@ -835,6 +842,11 @@ static status_t spifs_close(filecookie *fcookie) {
     spifs_file_t *file = (spifs_file_t *)fcookie;
 
     LTRACEF("cookie %p name '%s'\n", fcookie, file->metadata.filename);
+
+    mutex_acquire(&file->fs_handle->lock);
+    DEBUG_ASSERT(file->open_count > 0);
+    file->open_count--;
+    mutex_release(&file->fs_handle->lock);
 
     return NO_ERROR;
 }
@@ -855,6 +867,12 @@ static status_t spifs_remove(fscookie *cookie, const char *name) {
 
     if (!file) {
         status = ERR_NOT_FOUND;
+        goto err;
+    }
+
+    // Refuse to pull the data out from under an open filehandle.
+    if (file->open_count > 0) {
+        status = ERR_BUSY;
         goto err;
     }
 

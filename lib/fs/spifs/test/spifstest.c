@@ -41,6 +41,7 @@
     _(test_write_with_offset, 1, "Test that files can be written to at an offset.") \
     _(test_read_write_big, 1, "Test that an unaligned ~10kb buffer can be written and read.") \
     _(test_rm_active_dirent, 1, "Test that we can remove a file with an open dirent.") \
+    _(test_rm_while_open, 1, "Test that removing an open file is refused with ERR_BUSY.") \
     _(test_truncate_file, 1, "Test that we can truncate a file.")                \
     _(test_remount, 1, "Test that files survive an unmount/mount cycle.")
 
@@ -600,6 +601,47 @@ static bool test_rm_active_dirent(const char *dev_name) {
     free(ent);
 
     return success;
+}
+
+static bool test_rm_while_open(const char *dev_name) {
+    filehandle *handle;
+    if (fs_create_file(TEST_FILE_PATH, &handle, 16) != NO_ERROR) {
+        return false;
+    }
+
+    // Removing a file with an open handle must be refused, not freed under it...
+    if (fs_remove_file(TEST_FILE_PATH) != ERR_BUSY) {
+        fs_close_file(handle);
+        return false;
+    }
+
+    // ...and the handle must still be usable afterwards.
+    char buf[16];
+    if (fs_read_file(handle, buf, 0, sizeof(buf)) != (ssize_t)sizeof(buf)) {
+        fs_close_file(handle);
+        return false;
+    }
+
+    // A second open of the same file holds it busy on its own.
+    filehandle *handle2;
+    if (fs_open_file(TEST_FILE_PATH, &handle2) != NO_ERROR) {
+        fs_close_file(handle);
+        return false;
+    }
+    if (fs_close_file(handle) != NO_ERROR) {
+        fs_close_file(handle2);
+        return false;
+    }
+    if (fs_remove_file(TEST_FILE_PATH) != ERR_BUSY) {
+        fs_close_file(handle2);
+        return false;
+    }
+    if (fs_close_file(handle2) != NO_ERROR) {
+        return false;
+    }
+
+    // With every handle closed the remove goes through.
+    return fs_remove_file(TEST_FILE_PATH) == NO_ERROR;
 }
 
 static bool test_truncate_file(const char *dev_name) {
