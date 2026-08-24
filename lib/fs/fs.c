@@ -7,6 +7,7 @@
  */
 #include <lib/fs.h>
 
+#include <assert.h>
 #include <kernel/mutex.h>
 #include <lib/bio.h>
 #include <lk/debug.h>
@@ -19,11 +20,27 @@
 
 #define LOCAL_TRACE 0
 
-struct fs_mount {
-    struct list_node node;
+// The mount namespace is a tree of nodes, one per path component the layer
+// knows about. A node either has a filesystem mounted at it or is scaffolding:
+// an intermediate directory that exists only because a mount lives somewhere
+// beneath it (mounting at /mnt/foo creates "mnt" and "foo"). Path resolution
+// walks the tree by component; reaching a mounted node hands the rest of the
+// path to that filesystem. Listing a scaffold node enumerates its children,
+// which is what makes "ls /" work with no filesystem mounted at "/".
+struct fs_node {
+    struct list_node node;      // in parent->children
+    struct fs_node *parent;     // NULL only for the root
+    struct list_node children;  // of struct fs_node
+    int ref;                    // children + mounted fs + open dirhandles
+    struct fs_mount *mounted;   // filesystem mounted at this node, if any
+    char name[];                // single path component, "" for the root
+};
 
-    char *path;
-    size_t pathlen; // save the strlen of path above to help with path matching
+struct fs_mount {
+    struct list_node node;      // in the mounts list
+
+    char *path;                 // normalized mount point path, for display
+    struct fs_node *mountpoint; // node this filesystem is mounted at
     bdev_t *dev;
     fscookie *cookie;
     int ref;
@@ -37,23 +54,31 @@ struct filehandle {
 };
 
 struct dirhandle {
-    dircookie *cookie;
+    dircookie *cookie;          // fs cookie, or a scaffold_dircookie if mount == NULL
     struct fs_mount *mount;
 };
 
-static mutex_t mount_lock = MUTEX_INITIAL_VALUE(mount_lock);
+// protects the node tree, all refcounts, the mount list and the open scaffold
+// dir cookies
+static mutex_t fs_lock = MUTEX_INITIAL_VALUE(fs_lock);
 static struct list_node mounts = LIST_INITIAL_VALUE(mounts);
-static struct list_node fses = LIST_INITIAL_VALUE(fses);
 
-// list of all open rootfs dircookies; protected by mount_lock
-static struct list_node active_rootfs_cookies = LIST_INITIAL_VALUE(active_rootfs_cookies);
-
-struct rootfs_dircookie {
-    struct list_node node;        // linked into active_rootfs_cookies
-    char prefix[FS_MAX_PATH_LEN]; // normalised path being listed ("" or "/mnt")
-    struct fs_mount *current;     // next mount to scan from; NULL = exhausted
+static struct fs_node fs_root = {
+    .node = LIST_INITIAL_CLEARED_VALUE,
+    .parent = NULL,
+    .children = LIST_INITIAL_VALUE(fs_root.children),
+    .ref = 1, // never freed
+    .mounted = NULL,
 };
-static void rootfs_mount_removed(struct fs_mount *removed);
+
+// an open directory handle on a scaffold node; the cursor is a live pointer
+// into the child list, fixed up when the node it points at is pruned
+struct scaffold_dircookie {
+    struct list_node node;      // in active_scaffold_cookies
+    struct fs_node *dir;        // holds a ref
+    struct fs_node *next_child; // next child to report, NULL = exhausted
+};
+static struct list_node active_scaffold_cookies = LIST_INITIAL_VALUE(active_scaffold_cookies);
 
 // defined by the linker, wrapping all structs in the "fs_impl" section
 extern const struct fs_impl __start_fs_impl[] __WEAK;
@@ -76,72 +101,175 @@ void fs_dump_list(void) {
 
 void fs_dump_mounts(void) {
     printf("%-16s%s\n", "Filesystem", "Path");
-    mutex_acquire(&mount_lock);
+    mutex_acquire(&fs_lock);
     struct fs_mount *mount;
     list_for_every_entry(&mounts, mount, struct fs_mount, node) {
         printf("%-16s%s\n", mount->fs->name, mount->path);
     }
-    mutex_release(&mount_lock);
+    mutex_release(&fs_lock);
 }
 
-// find a mount structure based on the prefix of this path
-// bump the ref to the mount structure before returning
-static struct fs_mount *find_mount(const char *path, const char **trimmed_path) {
-    // paths must be absolute and start with /
-    if (path[0] != '/') {
+// ---------------------------------------------------------------------------
+// node tree primitives, all called with fs_lock held
+// ---------------------------------------------------------------------------
+
+static struct fs_node *node_find_child(struct fs_node *parent, const char *name, size_t len) {
+    struct fs_node *child;
+    list_for_every_entry(&parent->children, child, struct fs_node, node) {
+        if (strlen(child->name) == len && memcmp(child->name, name, len) == 0) {
+            return child;
+        }
+    }
+    return NULL;
+}
+
+// Creates a child with one reference, held by the caller; also accounts the
+// child's reference on the parent.
+static struct fs_node *node_add_child(struct fs_node *parent, const char *name, size_t len) {
+    struct fs_node *child = malloc(sizeof(struct fs_node) + len + 1);
+    if (!child) {
         return NULL;
     }
-    size_t pathlen = strlen(path);
 
-    mutex_acquire(&mount_lock);
-    struct fs_mount *mount;
-    list_for_every_entry(&mounts, mount, struct fs_mount, node) {
-        // if the path is shorter than this mount point, no point continuing
-        if (pathlen < mount->pathlen) {
-            continue;
-        }
+    memcpy(child->name, name, len);
+    child->name[len] = 0;
+    child->parent = parent;
+    list_initialize(&child->children);
+    child->ref = 1;
+    child->mounted = NULL;
 
-        LTRACEF("comparing %s with %s\n", path, mount->path);
+    list_add_tail(&parent->children, &child->node);
+    parent->ref++;
 
-        if (memcmp(path, mount->path, mount->pathlen) == 0) {
-            // If we got a match, make sure the next element in the path is
-            // a path separator or the end of the string. This keeps from
-            // matching /foo2 with /foo, but /foo/bar would match correctly.
-            if (path[mount->pathlen] != '/' && path[mount->pathlen] != 0) {
-                continue;
-            }
+    return child;
+}
 
-            // we got a match, skip forward to the next element
-            if (trimmed_path) {
-                *trimmed_path = &path[mount->pathlen];
-                // if we matched against the end of the path, at least return
-                // a "/".
-                // TODO: decide if this is necessary
-                if (*trimmed_path[0] == 0) {
-                    *trimmed_path = "/";
-                }
-            }
-
-            mount->ref++;
-
-            mutex_release(&mount_lock);
-            return mount;
+// Called before a child node is unlinked: any open scaffold dir cursor
+// pointing at it is advanced to the next sibling.
+static void scaffold_child_removed(struct fs_node *child) {
+    struct fs_node *next = list_next_type(&child->parent->children, &child->node,
+                                          struct fs_node, node);
+    struct scaffold_dircookie *dc;
+    list_for_every_entry(&active_scaffold_cookies, dc, struct scaffold_dircookie, node) {
+        if (dc->next_child == child) {
+            dc->next_child = next;
         }
     }
+}
 
-    mutex_release(&mount_lock);
-    return NULL;
+// Drop a reference; a node whose count hits zero is pruned, which recursively
+// drops the reference it held on its parent.
+static void node_release(struct fs_node *node) {
+    while (node && --node->ref == 0) {
+        struct fs_node *parent = node->parent;
+
+        DEBUG_ASSERT(parent); // the root holds a permanent self reference
+        DEBUG_ASSERT(list_is_empty(&node->children));
+        DEBUG_ASSERT(!node->mounted);
+
+        scaffold_child_removed(node);
+        list_delete(&node->node);
+        free(node);
+
+        node = parent;
+    }
+}
+
+// Resolution outcome for a normalized path: it either enters a mounted
+// filesystem (with the unconsumed remainder of the path), lands on a scaffold
+// node, or names nothing the layer knows about.
+enum resolve_result {
+    FS_RESOLVE_NONE,
+    FS_RESOLVE_MOUNT,
+    FS_RESOLVE_NODE,
+};
+
+// Walk a normalized path through the tree. On FS_RESOLVE_MOUNT a reference on
+// the mount is returned and *remainder points into the caller's path buffer
+// (or at a literal "/" when the mount point was named exactly). On
+// FS_RESOLVE_NODE a reference on the node is returned.
+static enum resolve_result fs_resolve(const char *path, struct fs_mount **out_mount,
+                                      const char **remainder, struct fs_node **out_node) {
+    // the normalized form of "/" is the empty string, which names the root
+    // node; everything else must be absolute
+    if (path[0] != '/' && path[0] != 0) {
+        return FS_RESOLVE_NONE;
+    }
+
+    mutex_acquire(&fs_lock);
+
+    struct fs_node *cur = &fs_root;
+    const char *pos = path; // always at a '/' or the terminator
+
+    for (;;) {
+        if (cur->mounted) {
+            struct fs_mount *mount = cur->mounted;
+            mount->ref++;
+            mutex_release(&fs_lock);
+            *out_mount = mount;
+            *remainder = (pos[0] == 0) ? "/" : pos;
+            return FS_RESOLVE_MOUNT;
+        }
+
+        if (pos[0] == 0) {
+            cur->ref++;
+            mutex_release(&fs_lock);
+            *out_node = cur;
+            return FS_RESOLVE_NODE;
+        }
+
+        // normalized paths have no empty components
+        const char *comp = pos + 1;
+        const char *end = strchr(comp, '/');
+        size_t len = end ? (size_t)(end - comp) : strlen(comp);
+
+        struct fs_node *child = node_find_child(cur, comp, len);
+        if (!child) {
+            mutex_release(&fs_lock);
+            return FS_RESOLVE_NONE;
+        }
+
+        cur = child;
+        pos = comp + len;
+    }
+}
+
+static void node_put(struct fs_node *node) {
+    mutex_acquire(&fs_lock);
+    node_release(node);
+    mutex_release(&fs_lock);
+}
+
+// find the mount a path leads into and the remainder of the path for the
+// filesystem to resolve; takes a reference on the mount
+static struct fs_mount *find_mount(const char *path, const char **trimmed_path) {
+    struct fs_mount *mount;
+    struct fs_node *node;
+    const char *remainder;
+
+    switch (fs_resolve(path, &mount, &remainder, &node)) {
+        case FS_RESOLVE_MOUNT:
+            if (trimmed_path) {
+                *trimmed_path = remainder;
+            }
+            return mount;
+        case FS_RESOLVE_NODE:
+            node_put(node);
+            return NULL;
+        default:
+            return NULL;
+    }
 }
 
 // decrement the ref to the mount structure, which may
 // cause an unmount operation
 static void put_mount(struct fs_mount *mount) {
-    mutex_acquire(&mount_lock);
+    mutex_acquire(&fs_lock);
     if ((--mount->ref) == 0) {
         LTRACEF("last ref, unmounting fs at '%s'\n", mount->path);
 
-        // advance any open rootfs iterators off this mount before unlinking
-        rootfs_mount_removed(mount);
+        struct fs_node *mountpoint = mount->mountpoint;
+        mountpoint->mounted = NULL;
 
         list_delete(&mount->node);
         mount->api->unmount(mount->cookie);
@@ -150,8 +278,11 @@ static void put_mount(struct fs_mount *mount) {
             bio_close(mount->dev);
         }
         free(mount);
+
+        // prunes the scaffolding up to the nearest still-referenced node
+        node_release(mountpoint);
     }
-    mutex_release(&mount_lock);
+    mutex_release(&fs_lock);
 }
 
 static status_t mount(const char *path, const char *device, const struct fs_impl *fs, enum fs_mount_options options) {
@@ -166,7 +297,7 @@ static status_t mount(const char *path, const char *device, const struct fs_impl
         return ERR_BAD_PATH;
     }
 
-    /* see if there's already something at this path, abort if there is */
+    /* see if there's already something at (or above) this path, abort if there is */
     mount = find_mount(temppath, NULL);
     if (mount) {
         put_mount(mount);
@@ -192,32 +323,90 @@ static status_t mount(const char *path, const char *device, const struct fs_impl
         return err;
     }
 
-    /* create the mount structure and add it to the list */
+    /* create the mount structure */
     mount = malloc(sizeof(struct fs_mount));
     if (!mount) {
-        if (dev) {
-            bio_close(dev);
-        }
-        return ERR_NO_MEMORY;
+        err = ERR_NO_MEMORY;
+        goto err_unmount;
     }
     mount->path = strdup(temppath);
     if (!mount->path) {
-        if (dev) {
-            bio_close(dev);
-        }
         free(mount);
-        return ERR_NO_MEMORY;
+        err = ERR_NO_MEMORY;
+        goto err_unmount;
     }
-    mount->pathlen = strlen(mount->path);
     mount->dev = dev;
     mount->cookie = cookie;
     mount->ref = 1;
     mount->fs = fs;
     mount->api = api;
 
+    /* walk to the mount point, creating scaffold nodes for any missing
+     * components, and attach the mount there */
+    mutex_acquire(&fs_lock);
+
+    struct fs_node *cur = &fs_root;
+    cur->ref++;
+    const char *pos = temppath;
+    while (pos[0] != 0) {
+        if (cur->mounted) {
+            // raced with another mount that now covers this path
+            node_release(cur);
+            mutex_release(&fs_lock);
+            free(mount->path);
+            free(mount);
+            err = ERR_ALREADY_MOUNTED;
+            goto err_unmount;
+        }
+
+        const char *comp = pos + 1;
+        const char *end = strchr(comp, '/');
+        size_t len = end ? (size_t)(end - comp) : strlen(comp);
+
+        struct fs_node *child = node_find_child(cur, comp, len);
+        if (child) {
+            child->ref++;
+        } else {
+            child = node_add_child(cur, comp, len);
+        }
+        node_release(cur);
+        if (!child) {
+            mutex_release(&fs_lock);
+            free(mount->path);
+            free(mount);
+            err = ERR_NO_MEMORY;
+            goto err_unmount;
+        }
+
+        cur = child;
+        pos = comp + len;
+    }
+
+    if (cur->mounted) {
+        node_release(cur);
+        mutex_release(&fs_lock);
+        free(mount->path);
+        free(mount);
+        err = ERR_ALREADY_MOUNTED;
+        goto err_unmount;
+    }
+
+    /* the walk's reference on the mount point becomes the mount's */
+    mount->mountpoint = cur;
+    cur->mounted = mount;
+
     list_add_head(&mounts, &mount->node);
 
+    mutex_release(&fs_lock);
+
     return 0;
+
+err_unmount:
+    api->unmount(cookie);
+    if (dev) {
+        bio_close(dev);
+    }
+    return err;
 }
 
 status_t fs_format_device(const char *fsname, const char *device, const void *args) {
@@ -256,8 +445,15 @@ status_t fs_unmount(const char *path) {
     strlcpy(temppath, path, sizeof(temppath));
     fs_normalize_path(temppath);
 
-    struct fs_mount *mount = find_mount(temppath, NULL);
+    const char *remainder;
+    struct fs_mount *mount = find_mount(temppath, &remainder);
     if (!mount) {
+        return ERR_NOT_FOUND;
+    }
+
+    // only the mount point itself may be unmounted, not a path inside it
+    if (remainder[0] != '/' || remainder[1] != 0) {
+        put_mount(mount);
         return ERR_NOT_FOUND;
     }
 
@@ -465,126 +661,50 @@ status_t fs_make_dir(const char *path) {
 }
 
 // ---------------------------------------------------------------------------
-// Intrinsic rootfs: enumerates the first path-component of every active mount
-// so that "ls /" works without any explicit filesystem mounted at "/".
-//
-// Design: dircookie holds a live pointer (current) into the mounts list.
-// readdir scans forward from current, using a backwards pass for dedup.
-// put_mount advances any in-flight cookies off a mount before removing it.
-// No per-entry heap allocations are made after opendir.
+// scaffold directory handles: listing a node of the mount namespace itself
 // ---------------------------------------------------------------------------
 
-// Called by put_mount (under mount_lock) before |removed| is unlinked.
-// Advances every open cookie whose current pointer is about to dangle.
-static void rootfs_mount_removed(struct fs_mount *removed) {
-    struct fs_mount *next = list_next_type(&mounts, &removed->node, struct fs_mount, node);
-    struct rootfs_dircookie *dc;
-    list_for_every_entry(&active_rootfs_cookies, dc, struct rootfs_dircookie, node) {
-        if (dc->current == removed) {
-            dc->current = next;
-        }
-    }
-}
-
-// Given mount |m| and a normalised |prefix|, return a pointer into m->path
-// for the first component after the prefix, and set *complen.  Returns NULL
-// if this mount is not a direct or indirect child of prefix.
-static const char *mount_component(const struct fs_mount *m, const char *prefix,
-                                   size_t plen, size_t *complen) {
-    const char *p = m->path;
-    if (plen == 0) {
-        if (p[0] != '/') {
-            return NULL;
-        }
-        p++;
-    } else {
-        if (strncmp(p, prefix, plen) != 0 || p[plen] != '/') {
-            return NULL;
-        }
-        p += plen + 1;
-    }
-    if (p[0] == '\0') {
-        return NULL;
-    }
-    const char *slash = strchr(p, '/');
-    *complen = slash ? (size_t)(slash - p) : strlen(p);
-    if (*complen == 0 || *complen >= FS_MAX_FILE_LEN) {
-        return NULL;
-    }
-    return p;
-}
-
-static status_t rootfs_opendir(const char *prefix, struct rootfs_dircookie **out) {
-    struct rootfs_dircookie *dc = calloc(1, sizeof(*dc));
+// takes over the caller's reference on the node
+static status_t scaffold_opendir(struct fs_node *node, struct scaffold_dircookie **out) {
+    struct scaffold_dircookie *dc = malloc(sizeof(*dc));
     if (!dc) {
         return ERR_NO_MEMORY;
     }
 
-    strlcpy(dc->prefix, prefix, sizeof(dc->prefix));
-    size_t plen = strlen(prefix);
-    bool matched = (plen == 0); // root is always valid
+    dc->dir = node;
 
-    mutex_acquire(&mount_lock);
-    dc->current = list_peek_head_type(&mounts, struct fs_mount, node);
-    if (!matched) {
-        // validate that at least one mount lives under this prefix
-        struct fs_mount *m;
-        list_for_every_entry(&mounts, m, struct fs_mount, node) {
-            if (strncmp(m->path, prefix, plen) == 0 && m->path[plen] == '/') {
-                matched = true;
-                break;
-            }
-        }
-    }
-    if (matched) {
-        list_add_tail(&active_rootfs_cookies, &dc->node);
-    }
-    mutex_release(&mount_lock);
-
-    if (!matched) {
-        free(dc);
-        return ERR_NOT_FOUND;
-    }
+    mutex_acquire(&fs_lock);
+    dc->next_child = list_peek_head_type(&node->children, struct fs_node, node);
+    list_add_tail(&active_scaffold_cookies, &dc->node);
+    mutex_release(&fs_lock);
 
     *out = dc;
     return NO_ERROR;
 }
 
-static status_t rootfs_readdir(struct rootfs_dircookie *dc, struct dirent *ent) {
-    const char *prefix = dc->prefix;
-    size_t plen = strlen(prefix);
+static status_t scaffold_readdir(struct scaffold_dircookie *dc, struct dirent *ent) {
+    mutex_acquire(&fs_lock);
 
-    mutex_acquire(&mount_lock);
-    struct fs_mount *m = dc->current;
-    while (m) {
-        struct fs_mount *next = list_next_type(&mounts, &m->node, struct fs_mount, node);
-        size_t complen;
-        const char *comp = mount_component(m, prefix, plen, &complen);
-        if (!comp) {
-            m = next;
-            continue;
-        }
-
-        dc->current = next;
-        size_t copy = (complen < sizeof(ent->name) - 1) ? complen : sizeof(ent->name) - 1;
-        memcpy(ent->name, comp, copy);
-        ent->name[copy] = '\0';
-        mutex_release(&mount_lock);
-        return NO_ERROR;
+    struct fs_node *child = dc->next_child;
+    if (!child) {
+        mutex_release(&fs_lock);
+        return ERR_NOT_FOUND;
     }
-    dc->current = NULL;
-    mutex_release(&mount_lock);
-    return ERR_NOT_FOUND;
+
+    strlcpy(ent->name, child->name, sizeof(ent->name));
+    dc->next_child = list_next_type(&dc->dir->children, &child->node, struct fs_node, node);
+
+    mutex_release(&fs_lock);
+    return NO_ERROR;
 }
 
-static void rootfs_closedir(struct rootfs_dircookie *dc) {
-    mutex_acquire(&mount_lock);
+static void scaffold_closedir(struct scaffold_dircookie *dc) {
+    mutex_acquire(&fs_lock);
     list_delete(&dc->node);
-    mutex_release(&mount_lock);
+    node_release(dc->dir);
+    mutex_release(&fs_lock);
     free(dc);
 }
-
-// ---------------------------------------------------------------------------
 
 status_t fs_open_dir(const char *path, dirhandle **handle) {
     char temppath[FS_MAX_PATH_LEN];
@@ -594,30 +714,34 @@ status_t fs_open_dir(const char *path, dirhandle **handle) {
 
     LTRACEF("path %s temppath %s\n", path, temppath);
 
+    struct fs_mount *mount;
+    struct fs_node *node;
     const char *newpath;
-    struct fs_mount *mount = find_mount(temppath, &newpath);
-    if (!mount) {
-        // temppath[0] == '\0'  → caller asked for "/" (root virtual dir)
-        // temppath[0] == '/'   → might be a virtual prefix of some mount
-        // rootfs_opendir returns ERR_NOT_FOUND for non-root paths with no match
-        if (temppath[0] == '\0' || temppath[0] == '/') {
-            struct rootfs_dircookie *dc;
-            status_t err = rootfs_opendir(temppath, &dc);
+
+    switch (fs_resolve(temppath, &mount, &newpath, &node)) {
+        case FS_RESOLVE_MOUNT:
+            break;
+        case FS_RESOLVE_NODE: {
+            // a directory of the mount namespace itself
+            struct scaffold_dircookie *dc;
+            status_t err = scaffold_opendir(node, &dc);
             if (err < 0) {
+                node_put(node);
                 return err;
             }
 
             dirhandle *d = malloc(sizeof(*d));
             if (!d) {
-                rootfs_closedir(dc);
+                scaffold_closedir(dc);
                 return ERR_NO_MEMORY;
             }
             d->cookie = (dircookie *)dc;
-            d->mount = NULL; // sentinel: rootfs handle
+            d->mount = NULL; // sentinel: scaffold handle
             *handle = d;
             return NO_ERROR;
         }
-        return ERR_NOT_FOUND;
+        default:
+            return ERR_NOT_FOUND;
     }
 
     LTRACEF("path %s temppath %s newpath %s\n", path, temppath, newpath);
@@ -649,7 +773,7 @@ status_t fs_open_dir(const char *path, dirhandle **handle) {
 
 status_t fs_read_dir(dirhandle *handle, struct dirent *ent) {
     if (!handle->mount) {
-        return rootfs_readdir((struct rootfs_dircookie *)handle->cookie, ent);
+        return scaffold_readdir((struct scaffold_dircookie *)handle->cookie, ent);
     }
 
     if (!handle->mount->api->readdir) {
@@ -661,7 +785,7 @@ status_t fs_read_dir(dirhandle *handle, struct dirent *ent) {
 
 status_t fs_close_dir(dirhandle *handle) {
     if (!handle->mount) {
-        rootfs_closedir((struct rootfs_dircookie *)handle->cookie);
+        scaffold_closedir((struct scaffold_dircookie *)handle->cookie);
         free(handle);
         return NO_ERROR;
     }
@@ -683,8 +807,12 @@ status_t fs_close_dir(dirhandle *handle) {
 status_t fs_stat_fs(const char *mountpoint, struct fs_stat *stat) {
     LTRACEF("mountpoint %s stat %p\n", mountpoint, stat);
 
-    const char *newpath;
-    struct fs_mount *mount = find_mount(mountpoint, &newpath);
+    char temppath[FS_MAX_PATH_LEN];
+
+    strlcpy(temppath, mountpoint, sizeof(temppath));
+    fs_normalize_path(temppath);
+
+    struct fs_mount *mount = find_mount(temppath, NULL);
     if (!mount) {
         return ERR_NOT_FOUND;
     }

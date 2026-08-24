@@ -330,11 +330,11 @@ static bool test_rootfs(void) {
     END_TEST;
 }
 
-// Verifies that mount/unmount operations occurring during an open dir iteration
-// do not crash or corrupt the iterator.  The live-pointer design means:
-//   - a mount removed while current points at it is advanced past automatically
-//   - a mount added (at list head) before the cursor is simply not seen
-// Both are acceptable behaviours for a best-effort virtual rootfs.
+// Verifies that mount/unmount operations occurring during an open dir
+// iteration do not crash or corrupt the iterator. Scaffold children are kept
+// in creation order and the cursor is a live pointer into that list:
+//   - a node removed while the cursor points at it is advanced past
+//   - a mount added behind the cursor (at the tail) is seen later in the pass
 static void test_rootfs_live_iter_teardown(void *ptr) {
     // best-effort; ignore errors for mounts that may already be gone
     fs_unmount("/live_a");
@@ -348,44 +348,115 @@ static bool test_rootfs_live_iter(void) {
 
     struct dirent ent;
 
-    // Set up three mounts.  list_add_head means the list order is c, b, a.
+    // Set up three mounts; scaffold children list in creation order a, b, c.
     ASSERT_EQ(NO_ERROR, fs_mount("/live_a", "memfs", NULL, FS_MOUNT_OPTION_NONE), "mount live_a");
     ASSERT_EQ(NO_ERROR, fs_mount("/live_b", "memfs", NULL, FS_MOUNT_OPTION_NONE), "mount live_b");
     ASSERT_EQ(NO_ERROR, fs_mount("/live_c", "memfs", NULL, FS_MOUNT_OPTION_NONE), "mount live_c");
 
-    // Open the iterator.  current starts at list head (live_c).
+    // Open the iterator; the cursor starts at the first child (live_a).
     dirhandle *dh;
     ASSERT_EQ(NO_ERROR, fs_open_dir("/", &dh), "open root dir");
 
-    // Read the first entry (live_c); current now points at live_b.
-    ASSERT_EQ(NO_ERROR, fs_read_dir(dh, &ent), "read first entry");
-    bool seen_c = (strcmp(ent.name, "live_c") == 0);
+    // Read the first live_* entry (other tests may have left mounts behind,
+    // which sort before ours in creation order); it must be live_a, after
+    // which the cursor points at live_b.
+    bool seen_a = false;
+    while (fs_read_dir(dh, &ent) == NO_ERROR) {
+        if (strncmp(ent.name, "live_", 5) == 0) {
+            seen_a = (strcmp(ent.name, "live_a") == 0);
+            break;
+        }
+    }
 
-    // Remove the mount that current is pointing at (live_b).
-    // rootfs_mount_removed() must advance current to live_a before unlinking.
+    // Remove the mount whose node the cursor points at (live_b); the cursor
+    // must be advanced off it before the node is pruned.
     EXPECT_EQ(NO_ERROR, fs_unmount("/live_b"), "unmount live_b mid-iter");
 
-    // Add a new mount at the head (before current) – iterator won't see it
-    // in this pass, which is acceptable.
+    // Add a new mount; its node lands at the tail, behind the cursor, so this
+    // same pass will reach it.
     EXPECT_EQ(NO_ERROR, fs_mount("/live_d", "memfs", NULL, FS_MOUNT_OPTION_NONE), "mount live_d mid-iter");
 
-    // Continue draining; live_b must not appear, live_a must appear.
-    // live_d may or may not appear depending on insertion order vs. cursor.
-    bool seen_b = false, seen_a = false;
+    // Drain: live_b must not appear, live_c and live_d must.
+    bool seen_b = false, seen_c = false, seen_d = false;
     while (fs_read_dir(dh, &ent) == NO_ERROR) {
         if (strcmp(ent.name, "live_b") == 0) {
             seen_b = true;
         }
-        if (strcmp(ent.name, "live_a") == 0) {
-            seen_a = true;
+        if (strcmp(ent.name, "live_c") == 0) {
+            seen_c = true;
         }
-        // also consume live_c/live_d without asserting – they are optional here
+        if (strcmp(ent.name, "live_d") == 0) {
+            seen_d = true;
+        }
     }
     fs_close_dir(dh);
 
-    EXPECT_TRUE(seen_c, "live_c seen before removal of live_b");
+    EXPECT_TRUE(seen_a, "live_a seen first");
     EXPECT_FALSE(seen_b, "live_b not seen after being unmounted mid-iter");
-    EXPECT_TRUE(seen_a, "live_a seen after live_b removal");
+    EXPECT_TRUE(seen_c, "live_c seen after live_b removal");
+    EXPECT_TRUE(seen_d, "live_d added mid-iter is reached");
+
+    END_TEST;
+}
+
+#define NS_BASE "/ns_test"
+
+static void test_mount_namespace_teardown(void *ptr) {
+    fs_remove_file(NS_BASE "/deep/mnt/file");
+    fs_unmount(NS_BASE "/deep/mnt");
+    fs_unmount(NS_BASE "/deep/mnt2");
+}
+
+static bool test_mount_namespace(void) {
+    __attribute__((cleanup(test_mount_namespace_teardown))) BEGIN_TEST;
+
+    // mounting deep creates the intermediate scaffold directories
+    ASSERT_EQ(NO_ERROR, fs_mount(NS_BASE "/deep/mnt", "memfs", NULL, FS_MOUNT_OPTION_NONE),
+              "deep mount");
+
+    // every intermediate level lists its single child
+    dirhandle *dh;
+    struct dirent ent;
+    ASSERT_EQ(NO_ERROR, fs_open_dir(NS_BASE, &dh), "open scaffold");
+    ASSERT_EQ(NO_ERROR, fs_read_dir(dh, &ent), "read scaffold");
+    EXPECT_EQ(0, strcmp(ent.name, "deep"), "child is deep");
+    EXPECT_EQ(ERR_NOT_FOUND, fs_read_dir(dh, &ent), "one child only");
+    EXPECT_EQ(NO_ERROR, fs_close_dir(dh), "close scaffold");
+
+    ASSERT_EQ(NO_ERROR, fs_open_dir(NS_BASE "/deep", &dh), "open inner scaffold");
+    ASSERT_EQ(NO_ERROR, fs_read_dir(dh, &ent), "read inner scaffold");
+    EXPECT_EQ(0, strcmp(ent.name, "mnt"), "child is mnt");
+    EXPECT_EQ(NO_ERROR, fs_close_dir(dh), "close inner scaffold");
+
+    // a file created through the deep path lands in the filesystem
+    filehandle *h;
+    ASSERT_EQ(NO_ERROR, fs_create_file(NS_BASE "/deep/mnt/file", &h, 16), "create");
+    EXPECT_EQ(NO_ERROR, fs_close_file(h), "close file");
+
+    // mounting on or below an existing mount is refused
+    EXPECT_EQ(ERR_ALREADY_MOUNTED,
+              fs_mount(NS_BASE "/deep/mnt", "memfs", NULL, FS_MOUNT_OPTION_NONE),
+              "mount on mount");
+    EXPECT_EQ(ERR_ALREADY_MOUNTED,
+              fs_mount(NS_BASE "/deep/mnt/sub", "memfs", NULL, FS_MOUNT_OPTION_NONE),
+              "mount below mount");
+
+    // a second mount under the same scaffold shares it
+    ASSERT_EQ(NO_ERROR, fs_mount(NS_BASE "/deep/mnt2", "memfs", NULL, FS_MOUNT_OPTION_NONE),
+              "sibling mount");
+
+    // unmounting by a path inside a mount is refused
+    EXPECT_EQ(ERR_NOT_FOUND, fs_unmount(NS_BASE "/deep/mnt/file"), "unmount inner path");
+
+    // unmounting prunes exactly the scaffolding nothing else needs
+    ASSERT_EQ(NO_ERROR, fs_remove_file(NS_BASE "/deep/mnt/file"), "remove file");
+    EXPECT_EQ(NO_ERROR, fs_unmount(NS_BASE "/deep/mnt"), "unmount first");
+    dirhandle *dh2;
+    EXPECT_EQ(ERR_NOT_FOUND, fs_open_dir(NS_BASE "/deep/mnt", &dh2), "mnt gone");
+    ASSERT_EQ(NO_ERROR, fs_open_dir(NS_BASE "/deep", &dh), "scaffold still present");
+    EXPECT_EQ(NO_ERROR, fs_close_dir(dh), "close remaining scaffold");
+    EXPECT_EQ(NO_ERROR, fs_unmount(NS_BASE "/deep/mnt2"), "unmount second");
+    EXPECT_EQ(ERR_NOT_FOUND, fs_open_dir(NS_BASE, &dh), "scaffold fully pruned");
 
     END_TEST;
 }
@@ -399,4 +470,5 @@ RUN_TEST(test_readdir);
 RUN_TEST(test_unmount_with_open_handle);
 RUN_TEST(test_rootfs);
 RUN_TEST(test_rootfs_live_iter);
+RUN_TEST(test_mount_namespace);
 END_TEST_CASE(fs_tests);
