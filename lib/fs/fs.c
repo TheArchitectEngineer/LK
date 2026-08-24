@@ -694,26 +694,6 @@ status_t fs_stat_fs(const char *mountpoint, struct fs_stat *stat) {
     return result;
 }
 
-ssize_t fs_load_file(const char *path, void *ptr, size_t maxlen) {
-    filehandle *handle;
-
-    /* open the file */
-    status_t err = fs_open_file(path, &handle);
-    if (err < 0) {
-        return err;
-    }
-
-    /* stat it for size, see how much we need to read */
-    struct file_stat stat;
-    fs_stat_file(handle, &stat);
-
-    ssize_t read_bytes = fs_read_file(handle, ptr, 0, MIN(maxlen, stat.size));
-
-    fs_close_file(handle);
-
-    return read_bytes;
-}
-
 const char *trim_name(const char *_name) {
     const char *name = &_name[0];
     // chew up leading spaces

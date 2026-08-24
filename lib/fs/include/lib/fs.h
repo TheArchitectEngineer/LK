@@ -73,9 +73,6 @@ status_t fs_close_dir(dirhandle *handle) __NONNULL();
 
 status_t fs_stat_fs(const char *mountpoint, struct fs_stat *stat) __NONNULL((1)) __NONNULL((2));
 
-/* convenience routines */
-ssize_t fs_load_file(const char *path, void *ptr, size_t maxlen) __NONNULL();
-
 /* walk through a path string, removing duplicate path separators, flattening . and .. references */
 void fs_normalize_path(char *path) __NONNULL();
 
