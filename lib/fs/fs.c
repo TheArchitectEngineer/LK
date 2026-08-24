@@ -38,6 +38,7 @@
 // long as any handle is open even after its node is gone.
 struct fs_node {
     struct list_node node;      // in parent->children
+    struct list_node lru_node;  // in the node cache lru when ref == 0
     struct fs_node *parent;     // NULL only for the root
     struct list_node children;  // of struct fs_node
     int ref;                    // children + mounted fs + open dirhandles + walks
@@ -45,6 +46,18 @@ struct fs_node {
     struct fs_vnode *vnode;     // object this node names, NULL for scaffolding
     char name[];                // single path component, "" for the root
 };
+
+// How many unreferenced name nodes to keep cached so a rewalk of a recent
+// path skips the filesystem lookups. Zero disables caching entirely: a node
+// is pruned the moment nothing references it. Override with the
+// FS_NODE_CACHE_SIZE build variable.
+#ifndef FS_NODE_CACHE_SIZE
+#if LK_EMBEDDED
+#define FS_NODE_CACHE_SIZE 0
+#else
+#define FS_NODE_CACHE_SIZE 64
+#endif
+#endif
 
 struct fs_mount {
     struct list_node node;      // in the mounts list
@@ -84,12 +97,18 @@ static struct list_node mounts = LIST_INITIAL_VALUE(mounts);
 
 static struct fs_node fs_root = {
     .node = LIST_INITIAL_CLEARED_VALUE,
+    .lru_node = LIST_INITIAL_CLEARED_VALUE,
     .parent = NULL,
     .children = LIST_INITIAL_VALUE(fs_root.children),
     .ref = 1, // never freed
     .mounted = NULL,
     .vnode = NULL,
 };
+
+// unreferenced but cached nodes, oldest at the head; all under fs_lock
+static struct list_node node_cache_lru = LIST_INITIAL_VALUE(node_cache_lru);
+static int node_cache_count;
+static int node_cache_max = FS_NODE_CACHE_SIZE;
 
 // an open directory handle on a scaffold node; the cursor is a live pointer
 // into the child list, fixed up when the node it points at is pruned
@@ -226,6 +245,7 @@ static struct fs_node *node_add_child(struct fs_node *parent, const char *name, 
 
     memcpy(child->name, name, len);
     child->name[len] = 0;
+    list_clear_node(&child->lru_node);
     child->parent = parent;
     list_initialize(&child->children);
     child->ref = 1;
@@ -236,6 +256,15 @@ static struct fs_node *node_add_child(struct fs_node *parent, const char *name, 
     parent->ref++;
 
     return child;
+}
+
+// take a reference on an existing node, reviving it if it was parked in the
+// node cache
+static void node_ref(struct fs_node *node) {
+    if (node->ref++ == 0) {
+        list_delete(&node->lru_node);
+        node_cache_count--;
+    }
 }
 
 // Called before a child node is unlinked: any open scaffold dir cursor
@@ -251,24 +280,50 @@ static void scaffold_child_removed(struct fs_node *child) {
     }
 }
 
-// Drop a reference; a node whose count hits zero is pruned, which drops its
-// reference on its vnode and, recursively, on its parent.
+// unlink and free a node whose count is zero and which is not on the lru;
+// returns the parent, whose reference the node held and the caller now owns
+static struct fs_node *node_prune_one(struct fs_node *node) {
+    struct fs_node *parent = node->parent;
+
+    DEBUG_ASSERT(parent); // the root holds a permanent self reference
+    DEBUG_ASSERT(list_is_empty(&node->children));
+    DEBUG_ASSERT(!node->mounted);
+
+    scaffold_child_removed(node);
+    list_delete(&node->node);
+    if (node->vnode) {
+        vnode_release_locked(node->vnode);
+    }
+    free(node);
+
+    return parent;
+}
+
+// Drop a reference. A filesystem name whose count hits zero is parked in the
+// node cache (when one is configured) so a rewalk skips the lookup; anything
+// else, and the oldest cache entries once over capacity, is pruned, which
+// drops the reference on the vnode and, iteratively, on the parent. Only
+// leaves can be at zero -- a child holds its parent's count up -- so cached
+// nodes never have children.
 static void node_release(struct fs_node *node) {
-    while (node && --node->ref == 0) {
-        struct fs_node *parent = node->parent;
-
-        DEBUG_ASSERT(parent); // the root holds a permanent self reference
-        DEBUG_ASSERT(list_is_empty(&node->children));
-        DEBUG_ASSERT(!node->mounted);
-
-        scaffold_child_removed(node);
-        list_delete(&node->node);
-        if (node->vnode) {
-            vnode_release_locked(node->vnode);
+    for (;;) {
+        while (node && --node->ref == 0) {
+            if (node->vnode && node_cache_max > 0) {
+                list_add_tail(&node_cache_lru, &node->lru_node);
+                node_cache_count++;
+                break;
+            }
+            node = node_prune_one(node);
         }
-        free(node);
 
-        node = parent;
+        if (node_cache_count <= node_cache_max) {
+            return;
+        }
+
+        struct fs_node *evict = list_remove_head_type(&node_cache_lru, struct fs_node, lru_node);
+        node_cache_count--;
+        // continue by dropping the reference the evicted node held on its parent
+        node = node_prune_one(evict);
     }
 }
 
@@ -282,6 +337,25 @@ static void node_put(struct fs_node *node) {
 // vnode a walk attached
 static struct fs_vnode *node_vnode(struct fs_node *node) {
     return node->mounted ? node->mounted->root : node->vnode;
+}
+
+void fs_set_node_cache_size(int size) {
+    if (size < 0) {
+        size = 0;
+    }
+
+    mutex_acquire(&fs_lock);
+    node_cache_max = size;
+    while (node_cache_count > node_cache_max) {
+        struct fs_node *evict = list_remove_head_type(&node_cache_lru, struct fs_node, lru_node);
+        node_cache_count--;
+        node_release(node_prune_one(evict));
+    }
+    mutex_release(&fs_lock);
+}
+
+int fs_get_node_cache_size(void) {
+    return node_cache_max;
 }
 
 // ---------------------------------------------------------------------------
@@ -395,7 +469,7 @@ static void fs_walk(char *path, uint flags, struct fs_walk_result *res) {
 
         struct fs_node *child = node_find_child(cur, comp, len);
         if (child) {
-            child->ref++;
+            node_ref(child);
         } else {
             if (!curvn) {
                 // a scaffold miss: the layer knows nothing below here
@@ -490,6 +564,24 @@ static void put_mount(struct fs_mount *mount) {
         LTRACEF("last ref, unmounting fs at '%s'\n", mount->path);
 
         struct fs_node *mountpoint = mount->mountpoint;
+
+        // evict every cached name belonging to this mount; pruning one can
+        // park its parent, so rescan until a pass finds nothing
+        bool again = true;
+        while (again) {
+            again = false;
+            struct fs_node *n, *temp;
+            list_for_every_entry_safe(&node_cache_lru, n, temp, struct fs_node, lru_node) {
+                if (n->vnode && n->vnode->mount == mount) {
+                    list_delete(&n->lru_node);
+                    node_cache_count--;
+                    node_release(node_prune_one(n));
+                    again = true;
+                    break;
+                }
+            }
+        }
+
         mountpoint->mounted = NULL;
 
         list_delete(&mount->node);
@@ -608,7 +700,7 @@ static status_t mount(const char *path, const char *device, const struct fs_impl
 
         struct fs_node *child = node_find_child(cur, comp, len);
         if (child) {
-            child->ref++;
+            node_ref(child);
         } else {
             child = node_add_child(cur, comp, len);
         }
@@ -948,12 +1040,18 @@ static status_t remove_common(char *temppath, bool dir) {
             struct fs_vnode *dirvn = node_vnode(res.node);
             status_t err;
 
-            // a node for the child can only exist here if something is
-            // enumerating or referencing it; refuse rather than surgery
+            // if the name is parked in the node cache, evict it: the entry is
+            // about to be invalidated. a node still referenced is a directory
+            // with cached descendants, which the filesystem will refuse as
+            // non-empty; it is accounted for in the handle check below.
             struct fs_node *child = node_find_child(res.node, res.last, strlen(res.last));
-            if (child) {
-                err = ERR_BUSY;
-                goto out;
+            if (child && child->ref == 0) {
+                list_delete(&child->lru_node);
+                node_cache_count--;
+                struct fs_node *parent = node_prune_one(child);
+                DEBUG_ASSERT(parent == res.node);
+                parent->ref--; // the reference the cached child held; ours keeps it alive
+                child = NULL;
             }
 
             // resolve the child so it can be checked and passed to the fs
@@ -975,15 +1073,19 @@ static status_t remove_common(char *temppath, bool dir) {
                 goto out;
             }
 
-            // the layer refuses to unlink anything with open handles: our
-            // transient reference is the only one a free object has
-            if (cvn->ref > 1) {
+            // the layer refuses to unlink anything with open handles: the
+            // only references a free object can have are our transient one
+            // and its own tree node's
+            if (cvn->ref > 1 + (child ? 1 : 0)) {
                 err = ERR_BUSY;
                 vnode_release_locked(cvn);
                 goto out;
             }
 
             err = op(dirvn, res.last, cvn);
+            // on success nothing can still name the child: a referenced node
+            // would have made the filesystem refuse the op as non-empty
+            DEBUG_ASSERT(err < 0 || !child);
             vnode_release_locked(cvn);
 
         out:

@@ -472,6 +472,93 @@ static bool test_rootfs_live_iter(void) {
     END_TEST;
 }
 
+#define CACHE_MNT "/fs_cache_test"
+
+// One full life cycle through the mount: build a tree, rewalk it enough
+// times to cycle any bounded cache, enumerate, unlink through names that may
+// be cached, and unmount with names still cached (the teardown sweep).
+static bool run_cache_exercise(void) {
+    BEGIN_TEST;
+
+    ASSERT_EQ(NO_ERROR, fs_mount(CACHE_MNT, "memfs", NULL, FS_MOUNT_OPTION_NONE), "mount");
+
+    ASSERT_EQ(NO_ERROR, fs_make_dir(CACHE_MNT "/d"), "mkdir");
+
+    char path[64];
+    filehandle *h;
+    for (int i = 0; i < 12; i++) {
+        snprintf(path, sizeof(path), CACHE_MNT "/d/f%d", i);
+        ASSERT_EQ(NO_ERROR, fs_create_file(path, &h, 4), "create");
+        ASSERT_EQ(NO_ERROR, fs_close_file(h), "close");
+    }
+
+    // rewalk every path a few times; with a small cache this cycles entries
+    // in and out, with none it prunes and re-looks-up every time
+    char buf[4];
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < 12; i++) {
+            snprintf(path, sizeof(path), CACHE_MNT "/d/f%d", i);
+            ASSERT_EQ(NO_ERROR, fs_open_file(path, &h), "reopen");
+            EXPECT_EQ(4, fs_read_file(h, buf, 0, sizeof(buf)), "read");
+            ASSERT_EQ(NO_ERROR, fs_close_file(h), "close reopened");
+        }
+    }
+
+    // a directory with this many entries enumerates completely
+    dirhandle *dh;
+    struct dirent ent;
+    ASSERT_EQ(NO_ERROR, fs_open_dir(CACHE_MNT "/d", &dh), "opendir");
+    int entries = 0;
+    while (fs_read_dir(dh, &ent) == NO_ERROR) {
+        entries++;
+    }
+    EXPECT_EQ(12, entries, "entry count");
+    ASSERT_EQ(NO_ERROR, fs_close_dir(dh), "closedir");
+
+    // unlink half of it through possibly-cached names, then verify the
+    // listing shrank to match
+    for (int i = 0; i < 6; i++) {
+        snprintf(path, sizeof(path), CACHE_MNT "/d/f%d", i);
+        ASSERT_EQ(NO_ERROR, fs_remove_file(path), "remove");
+        EXPECT_EQ(ERR_NOT_FOUND, fs_open_file(path, &h), "removed name gone");
+    }
+    ASSERT_EQ(NO_ERROR, fs_open_dir(CACHE_MNT "/d", &dh), "opendir again");
+    entries = 0;
+    while (fs_read_dir(dh, &ent) == NO_ERROR) {
+        entries++;
+    }
+    EXPECT_EQ(6, entries, "entry count after unlink");
+    ASSERT_EQ(NO_ERROR, fs_close_dir(dh), "closedir again");
+
+    // unmount with the remaining names likely still cached
+    EXPECT_EQ(NO_ERROR, fs_unmount(CACHE_MNT), "unmount");
+
+    END_TEST;
+}
+
+static void test_node_cache_teardown(void *ptr) {
+    fs_unmount(CACHE_MNT);
+    fs_set_node_cache_size(*(int *)ptr);
+}
+
+// The node cache must be behaviorally invisible: the same exercise passes
+// with it disabled, small enough to thrash, and at the build default.
+static bool test_node_cache(void) {
+    int saved __attribute__((cleanup(test_node_cache_teardown))) = fs_get_node_cache_size();
+    BEGIN_TEST;
+
+    fs_set_node_cache_size(0);
+    EXPECT_TRUE(run_cache_exercise(), "cache disabled");
+
+    fs_set_node_cache_size(4);
+    EXPECT_TRUE(run_cache_exercise(), "small cache");
+
+    fs_set_node_cache_size(saved);
+    EXPECT_TRUE(run_cache_exercise(), "default cache");
+
+    END_TEST;
+}
+
 #define NS_BASE "/ns_test"
 
 static void test_mount_namespace_teardown(void *ptr) {
@@ -545,4 +632,5 @@ RUN_TEST(test_unmount_with_open_handle);
 RUN_TEST(test_rootfs);
 RUN_TEST(test_rootfs_live_iter);
 RUN_TEST(test_mount_namespace);
+RUN_TEST(test_node_cache);
 END_TEST_CASE(fs_tests);

@@ -198,6 +198,12 @@ struct fs_impl {
 #define STATIC_FS_IMPL_LEGACY(_name, _api) const struct fs_impl __fs_impl_##_name __ALIGNED(sizeof(void *)) __SECTION("fs_impl") = \
                                         {.name = #_name, .legacy_api = _api}
 
+/* Resize the layer's node cache at runtime (primarily a test and bringup
+ * knob; the compile-time default comes from the FS_NODE_CACHE_SIZE build
+ * variable). Shrinking evicts immediately; zero disables caching. */
+void fs_set_node_cache_size(int size);
+int fs_get_node_cache_size(void);
+
 /* list all registered file systems */
 void fs_dump_list(void);
 
