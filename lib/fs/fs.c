@@ -355,6 +355,10 @@ status_t fs_create_file(const char *path, filehandle **handle, uint64_t len) {
 status_t fs_truncate_file(filehandle *handle, uint64_t len) {
     LTRACEF("filehandle %p, length %llu\n", handle, len);
 
+    if (!handle->mount->api->truncate) {
+        return ERR_NOT_SUPPORTED;
+    }
+
     return handle->mount->api->truncate(handle->cookie, len);
 }
 
