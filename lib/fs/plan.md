@@ -1,11 +1,11 @@
 # lib/fs: moving the path walk into the fs layer
 
-Status: in progress, 2026-08-24. Phases 0-3 are implemented on this branch:
+Status: in progress, 2026-08-24. Phases 0-4 are implemented on this branch:
 the pre-fixes and test expansion of §6 Phase 0, the node tree / vnode
 interface / walk of Phase 1, the memfs conversion plus the
-FS_NODE_CACHE_SIZE LRU of Phase 2, and the ext2 conversion of Phase 3.
-Sections below describe the design as proposed; deviations that emerged
-during implementation:
+FS_NODE_CACHE_SIZE LRU of Phase 2, the ext2 conversion of Phase 3 and the
+spifs conversion of Phase 4. Sections below describe the design as proposed;
+deviations that emerged during implementation:
 
 - the dirhandle holds the directory's *vnode* (plus the fs cursor), not the
   fs_node; nothing pins node chains for open files or dirs, the vnode does
@@ -22,8 +22,20 @@ during implementation:
   ext2's private limit of 4. A spliced path must fit FS_MAX_PATH_LEN (128),
   where the old ext2 walker allowed targets up to 512 bytes; over that the
   walk returns ERR_NOT_ENOUGH_BUFFER
+- a path *through* a name that does not exist on a flat filesystem is now
+  ERR_NOT_FOUND, not ERR_NOT_SUPPORTED: the walk fails on the missing
+  component before the filesystem is asked anything. Only an op the
+  filesystem does not implement at all (mkdir on spifs) still gives
+  ERR_NOT_SUPPORTED
+- a mount root can be opened with fs_open_file() and stat'd: it reports
+  is_dir with a zero size rather than an error. memfs already behaved this
+  way; spifs now matches, and docs/fs.md should state it as the contract
+- namespace ops run under the global fs_lock, so a create on spifs now holds
+  it across a flash erase and a ToC commit, as ext2's lookup holds it across
+  bcache I/O. That is what §4's locking decision buys; revisit only if a real
+  target shows contention
 
-Phases 3 (ext2), 4 (spifs), 5 (FAT), 6 (9p) and 7 (cleanup) remain.
+Phases 5 (FAT), 6 (9p) and 7 (cleanup) remain.
 
 ## 1. Problem and constraints
 
