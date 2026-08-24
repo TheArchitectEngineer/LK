@@ -34,7 +34,7 @@
 #define PMCR_EL0_C (1U << 2)
 #define PMCR_EL0_D (1U << 3)
 
-#define PMCNTENSET_EL0_C (1U << 31)
+#define PMCNTENSET_EL0_C (1UL << 31)
 
 /* Defined in start.S. */
 extern uint64_t arm64_boot_el;

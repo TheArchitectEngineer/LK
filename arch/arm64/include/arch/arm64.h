@@ -26,9 +26,21 @@ __BEGIN_CDECLS
     _val; \
 })
 
+/*
+ * MSR/MRS always transfer all 64 bits of a system register and the assembler
+ * only accepts an X register operand, so there is deliberately no 32 bit
+ * variant of these macros: the "w" constraint selects a vector register and
+ * the %w0 modifier assembles to an invalid instruction. Cast the value here so
+ * that callers passing a 32 bit type still get an x register rather than
+ * tripping clang's -Wasm-operand-widths.
+ *
+ * Note the cast sign extends a signed argument, so a negative 32 bit value
+ * lands as all ones in the upper half. That half is RES0 in every register
+ * written here, but pass an unsigned type if that ever stops being true.
+ */
 #define ARM64_WRITE_SYSREG(reg, val) \
 ({ \
-    __asm__ volatile("msr " TOSTRING(reg) ", %0" :: "r" (val)); \
+    __asm__ volatile("msr " TOSTRING(reg) ", %0" :: "r" ((uint64_t)(val))); \
     ISB; \
 })
 
