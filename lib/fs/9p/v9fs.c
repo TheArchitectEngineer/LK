@@ -165,7 +165,7 @@ status_t v9fs_unmount(fscookie *cookie) {
     return 0;
 }
 
-static const struct fs_api v9fs_api = {
+static const struct fs_legacy_api v9fs_api = {
     .format = NULL,
     .fs_stat = NULL,
 
@@ -188,4 +188,4 @@ static const struct fs_api v9fs_api = {
     .file_ioctl = NULL,
 };
 
-STATIC_FS_IMPL(9p, &v9fs_api);
+STATIC_FS_IMPL_LEGACY(9p, &v9fs_api);

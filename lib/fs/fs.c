@@ -24,15 +24,25 @@
 // knows about. A node either has a filesystem mounted at it or is scaffolding:
 // an intermediate directory that exists only because a mount lives somewhere
 // beneath it (mounting at /mnt/foo creates "mnt" and "foo"). Path resolution
-// walks the tree by component; reaching a mounted node hands the rest of the
-// path to that filesystem. Listing a scaffold node enumerates its children,
-// which is what makes "ls /" work with no filesystem mounted at "/".
+// walks the tree by component; reaching a filesystem on the legacy string
+// interface hands it the rest of the path, while a filesystem on the vnode
+// interface is asked to look up one component at a time, each resolved name
+// getting a node with its vnode attached. Listing a scaffold node enumerates
+// its children, which is what makes "ls /" work with no filesystem mounted
+// at "/".
+//
+// Lifetime is reference counted with no cache yet: a node is pruned the
+// moment nothing references it, so the resident tree is the scaffolding plus
+// whatever a walk is currently standing on. Open file handles reference the
+// vnode, not the node, so a file stays alive (and deduplicated by id) for as
+// long as any handle is open even after its node is gone.
 struct fs_node {
     struct list_node node;      // in parent->children
     struct fs_node *parent;     // NULL only for the root
     struct list_node children;  // of struct fs_node
-    int ref;                    // children + mounted fs + open dirhandles
+    int ref;                    // children + mounted fs + open dirhandles + walks
     struct fs_mount *mounted;   // filesystem mounted at this node, if any
+    struct fs_vnode *vnode;     // object this node names, NULL for scaffolding
     char name[];                // single path component, "" for the root
 };
 
@@ -45,21 +55,30 @@ struct fs_mount {
     fscookie *cookie;
     int ref;
     const struct fs_impl *fs;
-    const struct fs_api *api;
+    const struct fs_api *api;               // exactly one of these two is set
+    const struct fs_legacy_api *legacy_api;
+
+    struct fs_vnode *root;      // root vnode (vnode interface only)
+    struct list_node vnodes;    // every live vnode of this mount, for dedup by id
 };
 
 struct filehandle {
-    filecookie *cookie;
     struct fs_mount *mount;
+    union {
+        filecookie *cookie;     // legacy interface
+        struct fs_vnode *vnode; // vnode interface
+    };
 };
 
 struct dirhandle {
-    dircookie *cookie;          // fs cookie, or a scaffold_dircookie if mount == NULL
-    struct fs_mount *mount;
+    struct fs_mount *mount;     // NULL for a scaffold directory handle
+    dircookie *cookie;          // fs cursor, or a scaffold_dircookie
+    struct fs_vnode *vnode;     // the directory (vnode interface only)
 };
 
-// protects the node tree, all refcounts, the mount list and the open scaffold
-// dir cookies
+// protects the node tree, all refcounts, the mount list, the vnode lists and
+// the open scaffold dir cookies; held across the namespace ops of the vnode
+// interface (lookup/create/mkdir/unlink/rmdir), but never across file I/O
 static mutex_t fs_lock = MUTEX_INITIAL_VALUE(fs_lock);
 static struct list_node mounts = LIST_INITIAL_VALUE(mounts);
 
@@ -69,6 +88,7 @@ static struct fs_node fs_root = {
     .children = LIST_INITIAL_VALUE(fs_root.children),
     .ref = 1, // never freed
     .mounted = NULL,
+    .vnode = NULL,
 };
 
 // an open directory handle on a scaffold node; the cursor is a live pointer
@@ -110,6 +130,74 @@ void fs_dump_mounts(void) {
 }
 
 // ---------------------------------------------------------------------------
+// vnode lifetime, all called with fs_lock held unless noted
+// ---------------------------------------------------------------------------
+
+status_t fs_vnode_create(uint64_t id, enum fs_vnode_type type, void *priv,
+                         struct fs_vnode **out) {
+    struct fs_vnode *vn = malloc(sizeof(*vn));
+    if (!vn) {
+        return ERR_NO_MEMORY;
+    }
+
+    list_clear_node(&vn->node);
+    vn->mount = NULL;
+    vn->ref = 1; // the reference the filesystem hands back to the layer
+    vn->cookie = NULL;
+    vn->id = id;
+    vn->type = type;
+    vn->priv = priv;
+
+    *out = vn;
+    return NO_ERROR;
+}
+
+// Take ownership of a vnode freshly returned by the filesystem: bind it to
+// its mount and deduplicate by id, so two lookups of one object always yield
+// one vnode. Returns the canonical vnode carrying the caller's reference.
+static struct fs_vnode *vnode_adopt_locked(struct fs_mount *mount, struct fs_vnode *vn) {
+    DEBUG_ASSERT(vn->mount == NULL);
+
+    vn->mount = mount;
+    vn->cookie = mount->cookie;
+
+    if (vn->id != 0) {
+        struct fs_vnode *existing;
+        list_for_every_entry(&mount->vnodes, existing, struct fs_vnode, node) {
+            if (existing->id == vn->id) {
+                existing->ref++;
+                // discard the duplicate the filesystem just handed us
+                if (mount->api->release) {
+                    mount->api->release(vn);
+                }
+                free(vn);
+                return existing;
+            }
+        }
+    }
+
+    list_add_tail(&mount->vnodes, &vn->node);
+    return vn;
+}
+
+static void vnode_release_locked(struct fs_vnode *vn) {
+    DEBUG_ASSERT(vn->ref > 0);
+    if (--vn->ref == 0) {
+        list_delete(&vn->node);
+        if (vn->mount->api->release) {
+            vn->mount->api->release(vn);
+        }
+        free(vn);
+    }
+}
+
+static void vnode_put(struct fs_vnode *vn) {
+    mutex_acquire(&fs_lock);
+    vnode_release_locked(vn);
+    mutex_release(&fs_lock);
+}
+
+// ---------------------------------------------------------------------------
 // node tree primitives, all called with fs_lock held
 // ---------------------------------------------------------------------------
 
@@ -137,6 +225,7 @@ static struct fs_node *node_add_child(struct fs_node *parent, const char *name, 
     list_initialize(&child->children);
     child->ref = 1;
     child->mounted = NULL;
+    child->vnode = NULL;
 
     list_add_tail(&parent->children, &child->node);
     parent->ref++;
@@ -157,8 +246,8 @@ static void scaffold_child_removed(struct fs_node *child) {
     }
 }
 
-// Drop a reference; a node whose count hits zero is pruned, which recursively
-// drops the reference it held on its parent.
+// Drop a reference; a node whose count hits zero is pruned, which drops its
+// reference on its vnode and, recursively, on its parent.
 static void node_release(struct fs_node *node) {
     while (node && --node->ref == 0) {
         struct fs_node *parent = node->parent;
@@ -169,68 +258,12 @@ static void node_release(struct fs_node *node) {
 
         scaffold_child_removed(node);
         list_delete(&node->node);
+        if (node->vnode) {
+            vnode_release_locked(node->vnode);
+        }
         free(node);
 
         node = parent;
-    }
-}
-
-// Resolution outcome for a normalized path: it either enters a mounted
-// filesystem (with the unconsumed remainder of the path), lands on a scaffold
-// node, or names nothing the layer knows about.
-enum resolve_result {
-    FS_RESOLVE_NONE,
-    FS_RESOLVE_MOUNT,
-    FS_RESOLVE_NODE,
-};
-
-// Walk a normalized path through the tree. On FS_RESOLVE_MOUNT a reference on
-// the mount is returned and *remainder points into the caller's path buffer
-// (or at a literal "/" when the mount point was named exactly). On
-// FS_RESOLVE_NODE a reference on the node is returned.
-static enum resolve_result fs_resolve(const char *path, struct fs_mount **out_mount,
-                                      const char **remainder, struct fs_node **out_node) {
-    // the normalized form of "/" is the empty string, which names the root
-    // node; everything else must be absolute
-    if (path[0] != '/' && path[0] != 0) {
-        return FS_RESOLVE_NONE;
-    }
-
-    mutex_acquire(&fs_lock);
-
-    struct fs_node *cur = &fs_root;
-    const char *pos = path; // always at a '/' or the terminator
-
-    for (;;) {
-        if (cur->mounted) {
-            struct fs_mount *mount = cur->mounted;
-            mount->ref++;
-            mutex_release(&fs_lock);
-            *out_mount = mount;
-            *remainder = (pos[0] == 0) ? "/" : pos;
-            return FS_RESOLVE_MOUNT;
-        }
-
-        if (pos[0] == 0) {
-            cur->ref++;
-            mutex_release(&fs_lock);
-            *out_node = cur;
-            return FS_RESOLVE_NODE;
-        }
-
-        // normalized paths have no empty components
-        const char *comp = pos + 1;
-        const char *end = strchr(comp, '/');
-        size_t len = end ? (size_t)(end - comp) : strlen(comp);
-
-        struct fs_node *child = node_find_child(cur, comp, len);
-        if (!child) {
-            mutex_release(&fs_lock);
-            return FS_RESOLVE_NONE;
-        }
-
-        cur = child;
-        pos = comp + len;
     }
 }
 
@@ -240,21 +273,204 @@ static void node_put(struct fs_node *node) {
     mutex_release(&fs_lock);
 }
 
-// find the mount a path leads into and the remainder of the path for the
-// filesystem to resolve; takes a reference on the mount
-static struct fs_mount *find_mount(const char *path, const char **trimmed_path) {
-    struct fs_mount *mount;
-    struct fs_node *node;
-    const char *remainder;
+// the filesystem object a node presents: a mounted filesystem's root, or the
+// vnode a walk attached
+static struct fs_vnode *node_vnode(struct fs_node *node) {
+    return node->mounted ? node->mounted->root : node->vnode;
+}
 
-    switch (fs_resolve(path, &mount, &remainder, &node)) {
-        case FS_RESOLVE_MOUNT:
-            if (trimmed_path) {
-                *trimmed_path = remainder;
+// ---------------------------------------------------------------------------
+// the walk
+// ---------------------------------------------------------------------------
+
+enum fs_walk_kind {
+    FS_WALK_FAILED = 0, // status in err
+    FS_WALK_LEGACY,     // entered a legacy mount: mount ref held, remainder set
+    FS_WALK_NODE,       // resolved the whole path to a node (ref held); mount
+                        // ref held too unless it is pure scaffolding
+    FS_WALK_PARENT,     // stopped at the parent directory inside a filesystem:
+                        // node + mount refs held, last is the final component
+};
+
+struct fs_walk_result {
+    enum fs_walk_kind kind;
+    status_t err;
+    struct fs_mount *mount;
+    const char *remainder; // FS_WALK_LEGACY; points into the caller's buffer or at "/"
+    struct fs_node *node;  // FS_WALK_NODE / FS_WALK_PARENT
+    const char *last;      // FS_WALK_PARENT; points into the caller's buffer
+};
+
+#define FS_WALK_FLAG_PARENT 0x1
+
+// Walk a normalized path (which the walk may temporarily poke NUL terminators
+// into) through the tree, asking vnode-interface filesystems to resolve one
+// component at a time.
+static void fs_walk(char *path, uint flags, struct fs_walk_result *res) {
+    memset(res, 0, sizeof(*res));
+    res->kind = FS_WALK_FAILED;
+    res->err = ERR_NOT_FOUND;
+
+    // the normalized form of "/" is the empty string, which names the root
+    // node; everything else must be absolute
+    if (path[0] != '/' && path[0] != 0) {
+        return;
+    }
+
+    mutex_acquire(&fs_lock);
+
+    struct fs_node *cur = &fs_root;
+    cur->ref++;
+    char *pos = path; // always at a '/' or the terminator
+
+    for (;;) {
+        // entering a legacy mount hands the rest of the path to the filesystem
+        if (cur->mounted && cur->mounted->legacy_api) {
+            struct fs_mount *mount = cur->mounted;
+            mount->ref++;
+            node_release(cur);
+            mutex_release(&fs_lock);
+            res->kind = FS_WALK_LEGACY;
+            res->mount = mount;
+            res->remainder = (pos[0] == 0) ? "/" : pos;
+            return;
+        }
+
+        struct fs_vnode *curvn = node_vnode(cur);
+
+        if (pos[0] == 0) {
+            // resolved the whole path to this node
+            if (flags & FS_WALK_FLAG_PARENT) {
+                // the parent of "/" (or of a mount point seen from outside)
+                // is not inside any filesystem
+                node_release(cur);
+                mutex_release(&fs_lock);
+                res->err = ERR_NOT_FOUND;
+                return;
             }
-            return mount;
-        case FS_RESOLVE_NODE:
-            node_put(node);
+            if (curvn) {
+                curvn->mount->ref++;
+                res->mount = curvn->mount;
+            }
+            mutex_release(&fs_lock);
+            res->kind = FS_WALK_NODE;
+            res->node = cur;
+            return;
+        }
+
+        // normalized paths have no empty components
+        char *comp = pos + 1;
+        char *end = strchr(comp, '/');
+        size_t len = end ? (size_t)(end - comp) : strlen(comp);
+        char *rest = comp + len; // at the next '/' or the terminator
+
+        // parent mode stops before the last component
+        if ((flags & FS_WALK_FLAG_PARENT) && rest[0] == 0) {
+            if (!curvn) {
+                // the parent would be scaffolding, which no filesystem backs
+                node_release(cur);
+                mutex_release(&fs_lock);
+                res->err = ERR_NOT_FOUND;
+                return;
+            }
+            if (curvn->type != FS_VNODE_DIR) {
+                node_release(cur);
+                mutex_release(&fs_lock);
+                res->err = ERR_NOT_DIR;
+                return;
+            }
+            curvn->mount->ref++;
+            mutex_release(&fs_lock);
+            res->kind = FS_WALK_PARENT;
+            res->mount = curvn->mount;
+            res->node = cur;
+            res->last = comp;
+            return;
+        }
+
+        struct fs_node *child = node_find_child(cur, comp, len);
+        if (child) {
+            child->ref++;
+        } else {
+            if (!curvn) {
+                // a scaffold miss: the layer knows nothing below here
+                node_release(cur);
+                mutex_release(&fs_lock);
+                res->err = ERR_NOT_FOUND;
+                return;
+            }
+            if (curvn->type != FS_VNODE_DIR) {
+                node_release(cur);
+                mutex_release(&fs_lock);
+                res->err = ERR_NOT_DIR;
+                return;
+            }
+
+            // ask the filesystem for this one component
+            char saved = *rest;
+            *rest = 0;
+            struct fs_vnode *vn;
+            status_t err = curvn->mount->api->lookup(curvn, comp, &vn);
+            *rest = saved;
+            if (err < 0) {
+                node_release(cur);
+                mutex_release(&fs_lock);
+                res->err = err;
+                return;
+            }
+
+            vn = vnode_adopt_locked(curvn->mount, vn);
+            child = node_add_child(cur, comp, len);
+            if (!child) {
+                vnode_release_locked(vn);
+                node_release(cur);
+                mutex_release(&fs_lock);
+                res->err = ERR_NO_MEMORY;
+                return;
+            }
+            child->vnode = vn; // the node owns this reference
+        }
+
+        node_release(cur);
+        cur = child;
+        pos = rest;
+    }
+}
+
+// Consume a FS_WALK_NODE reference, returning a referenced vnode; the node is
+// released (and pruned if nothing else holds it, the vnode surviving through
+// the returned reference).
+static struct fs_vnode *walk_node_to_vnode(struct fs_node *node) {
+    mutex_acquire(&fs_lock);
+    struct fs_vnode *vn = node_vnode(node);
+    DEBUG_ASSERT(vn);
+    vn->ref++;
+    node_release(node);
+    mutex_release(&fs_lock);
+    return vn;
+}
+
+// find the mount a path leads into and the remainder of the path for the
+// filesystem to resolve; takes a reference on the mount. legacy only.
+static struct fs_mount *find_mount(char *path, const char **trimmed_path) {
+    struct fs_walk_result res;
+    fs_walk(path, 0, &res);
+
+    switch (res.kind) {
+        case FS_WALK_LEGACY:
+            if (trimmed_path) {
+                *trimmed_path = res.remainder;
+            }
+            return res.mount;
+        case FS_WALK_NODE:
+            node_put(res.node);
+            if (res.mount) {
+                // put_mount would be circular here; drop the plain ref
+                mutex_acquire(&fs_lock);
+                res.mount->ref--;
+                DEBUG_ASSERT(res.mount->ref > 0);
+                mutex_release(&fs_lock);
+            }
             return NULL;
         default:
             return NULL;
@@ -272,7 +488,13 @@ static void put_mount(struct fs_mount *mount) {
         mountpoint->mounted = NULL;
 
         list_delete(&mount->node);
-        mount->api->unmount(mount->cookie);
+        if (mount->legacy_api) {
+            mount->legacy_api->unmount(mount->cookie);
+        } else {
+            vnode_release_locked(mount->root);
+            DEBUG_ASSERT(list_is_empty(&mount->vnodes));
+            mount->api->unmount(mount->cookie);
+        }
         free(mount->path);
         if (mount->dev) {
             bio_close(mount->dev);
@@ -287,7 +509,6 @@ static void put_mount(struct fs_mount *mount) {
 
 static status_t mount(const char *path, const char *device, const struct fs_impl *fs, enum fs_mount_options options) {
     struct fs_mount *mount;
-    const struct fs_api *api = fs->api;
     char temppath[FS_MAX_PATH_LEN];
 
     strlcpy(temppath, path, sizeof(temppath));
@@ -315,7 +536,20 @@ static status_t mount(const char *path, const char *device, const struct fs_impl
 
     /* call into the fs implementation */
     fscookie *cookie;
-    status_t err = api->mount(dev, &cookie, options);
+    struct fs_vnode *root = NULL;
+    status_t err;
+    if (fs->legacy_api) {
+        err = fs->legacy_api->mount(dev, &cookie, options);
+    } else {
+        err = fs->api->mount(dev, options, &cookie, &root);
+        if (err >= 0 && (!root || root->type != FS_VNODE_DIR)) {
+            // a filesystem must produce a directory as its root
+            if (fs->api->unmount) {
+                fs->api->unmount(cookie);
+            }
+            err = ERR_NOT_VALID;
+        }
+    }
     if (err < 0) {
         if (dev) {
             bio_close(dev);
@@ -339,7 +573,10 @@ static status_t mount(const char *path, const char *device, const struct fs_impl
     mount->cookie = cookie;
     mount->ref = 1;
     mount->fs = fs;
-    mount->api = api;
+    mount->api = fs->api;
+    mount->legacy_api = fs->legacy_api;
+    mount->root = NULL;
+    list_initialize(&mount->vnodes);
 
     /* walk to the mount point, creating scaffold nodes for any missing
      * components, and attach the mount there */
@@ -349,8 +586,9 @@ static status_t mount(const char *path, const char *device, const struct fs_impl
     cur->ref++;
     const char *pos = temppath;
     while (pos[0] != 0) {
-        if (cur->mounted) {
-            // raced with another mount that now covers this path
+        if (cur->mounted || cur->vnode) {
+            // raced with another mount that now covers this path, or the path
+            // leads into a filesystem
             node_release(cur);
             mutex_release(&fs_lock);
             free(mount->path);
@@ -382,7 +620,7 @@ static status_t mount(const char *path, const char *device, const struct fs_impl
         pos = comp + len;
     }
 
-    if (cur->mounted) {
+    if (cur->mounted || cur->vnode) {
         node_release(cur);
         mutex_release(&fs_lock);
         free(mount->path);
@@ -395,6 +633,11 @@ static status_t mount(const char *path, const char *device, const struct fs_impl
     mount->mountpoint = cur;
     cur->mounted = mount;
 
+    /* adopt the root vnode */
+    if (root) {
+        mount->root = vnode_adopt_locked(mount, root);
+    }
+
     list_add_head(&mounts, &mount->node);
 
     mutex_release(&fs_lock);
@@ -402,7 +645,17 @@ static status_t mount(const char *path, const char *device, const struct fs_impl
     return 0;
 
 err_unmount:
-    api->unmount(cookie);
+    if (fs->legacy_api) {
+        fs->legacy_api->unmount(cookie);
+    } else {
+        if (root) {
+            if (fs->api->release) {
+                fs->api->release(root);
+            }
+            free(root);
+        }
+        fs->api->unmount(cookie);
+    }
     if (dev) {
         bio_close(dev);
     }
@@ -415,7 +668,9 @@ status_t fs_format_device(const char *fsname, const char *device, const void *ar
         return ERR_NOT_FOUND;
     }
 
-    if (fs->api->format == NULL) {
+    status_t (*format)(struct bdev *, const void *) =
+        fs->legacy_api ? fs->legacy_api->format : fs->api->format;
+    if (format == NULL) {
         return ERR_NOT_SUPPORTED;
     }
 
@@ -427,7 +682,7 @@ status_t fs_format_device(const char *fsname, const char *device, const void *ar
         }
     }
 
-    return fs->api->format(dev, args);
+    return format(dev, args);
 }
 
 status_t fs_mount(const char *path, const char *fsname, const char *device, enum fs_mount_options options) {
@@ -445,19 +700,37 @@ status_t fs_unmount(const char *path) {
     strlcpy(temppath, path, sizeof(temppath));
     fs_normalize_path(temppath);
 
-    const char *remainder;
-    struct fs_mount *mount = find_mount(temppath, &remainder);
-    if (!mount) {
-        return ERR_NOT_FOUND;
+    struct fs_walk_result res;
+    fs_walk(temppath, 0, &res);
+
+    struct fs_mount *mount;
+    switch (res.kind) {
+        case FS_WALK_LEGACY:
+            // only the mount point itself may be unmounted, not a path inside it
+            if (res.remainder[0] != '/' || res.remainder[1] != 0) {
+                put_mount(res.mount);
+                return ERR_NOT_FOUND;
+            }
+            mount = res.mount;
+            break;
+        case FS_WALK_NODE:
+            if (!res.node->mounted) {
+                // scaffolding or a name inside a filesystem
+                node_put(res.node);
+                if (res.mount) {
+                    put_mount(res.mount);
+                }
+                return ERR_NOT_FOUND;
+            }
+            mount = res.mount;
+            DEBUG_ASSERT(mount == res.node->mounted);
+            node_put(res.node);
+            break;
+        default:
+            return res.err;
     }
 
-    // only the mount point itself may be unmounted, not a path inside it
-    if (remainder[0] != '/' || remainder[1] != 0) {
-        put_mount(mount);
-        return ERR_NOT_FOUND;
-    }
-
-    // return the ref that find_mount added and one extra
+    // return the ref that the walk added and one extra
     put_mount(mount);
     put_mount(mount);
 
@@ -472,43 +745,53 @@ status_t fs_open_file(const char *path, filehandle **handle) {
 
     LTRACEF("path %s temppath %s\n", path, temppath);
 
-    const char *newpath;
-    struct fs_mount *mount = find_mount(temppath, &newpath);
-    if (!mount) {
-        return ERR_NOT_FOUND;
+    struct fs_walk_result res;
+    fs_walk(temppath, 0, &res);
+
+    filehandle *f;
+    switch (res.kind) {
+        case FS_WALK_LEGACY: {
+            filecookie *cookie;
+            status_t err = res.mount->legacy_api->open(res.mount->cookie, res.remainder, &cookie);
+            if (err < 0) {
+                put_mount(res.mount);
+                return err;
+            }
+
+            f = malloc(sizeof(*f));
+            if (!f) {
+                res.mount->legacy_api->close(cookie);
+                put_mount(res.mount);
+                return ERR_NO_MEMORY;
+            }
+            f->cookie = cookie;
+            f->mount = res.mount;
+            break;
+        }
+        case FS_WALK_NODE: {
+            if (!res.mount) {
+                // pure scaffolding is not a file
+                node_put(res.node);
+                return ERR_NOT_FOUND;
+            }
+            struct fs_vnode *vn = walk_node_to_vnode(res.node);
+
+            f = malloc(sizeof(*f));
+            if (!f) {
+                vnode_put(vn);
+                put_mount(res.mount);
+                return ERR_NO_MEMORY;
+            }
+            f->vnode = vn;
+            f->mount = res.mount;
+            break;
+        }
+        default:
+            return res.err;
     }
 
-    LTRACEF("path %s temppath %s newpath %s\n", path, temppath, newpath);
-
-    filecookie *cookie;
-    status_t err = mount->api->open(mount->cookie, newpath, &cookie);
-    if (err < 0) {
-        put_mount(mount);
-        return err;
-    }
-
-    filehandle *f = malloc(sizeof(*f));
-    if (!f) {
-        mount->api->close(cookie);
-        put_mount(mount);
-        return ERR_NO_MEMORY;
-    }
-    f->cookie = cookie;
-    f->mount = mount;
     *handle = f;
-
     return 0;
-}
-
-status_t fs_file_ioctl(filehandle *handle, int request, void *argp) {
-    LTRACEF("filehandle %p, request %d, argp, %p\n", handle, request, argp);
-
-    if (unlikely(!handle->mount ||
-                 !handle->mount->api || !handle->mount->api->file_ioctl)) {
-        return ERR_INVALID_ARGS;
-    }
-
-    return handle->mount->api->file_ioctl(handle->cookie, request, argp);
 }
 
 status_t fs_create_file(const char *path, filehandle **handle, uint64_t len) {
@@ -517,45 +800,196 @@ status_t fs_create_file(const char *path, filehandle **handle, uint64_t len) {
     strlcpy(temppath, path, sizeof(temppath));
     fs_normalize_path(temppath);
 
-    const char *newpath;
-    struct fs_mount *mount = find_mount(temppath, &newpath);
-    if (!mount) {
-        return ERR_NOT_FOUND;
+    struct fs_walk_result res;
+    fs_walk(temppath, FS_WALK_FLAG_PARENT, &res);
+
+    filehandle *f;
+    switch (res.kind) {
+        case FS_WALK_LEGACY: {
+            if (!res.mount->legacy_api->create) {
+                put_mount(res.mount);
+                return ERR_NOT_SUPPORTED;
+            }
+
+            filecookie *cookie;
+            status_t err = res.mount->legacy_api->create(res.mount->cookie, res.remainder, &cookie, len);
+            if (err < 0) {
+                put_mount(res.mount);
+                return err;
+            }
+
+            f = malloc(sizeof(*f));
+            if (!f) {
+                res.mount->legacy_api->close(cookie);
+                put_mount(res.mount);
+                return ERR_NO_MEMORY;
+            }
+            f->cookie = cookie;
+            f->mount = res.mount;
+            break;
+        }
+        case FS_WALK_PARENT: {
+            if (!res.mount->api->create) {
+                node_put(res.node);
+                put_mount(res.mount);
+                return ERR_NOT_SUPPORTED;
+            }
+
+            mutex_acquire(&fs_lock);
+            struct fs_vnode *vn;
+            status_t err = res.mount->api->create(node_vnode(res.node), res.last, len, &vn);
+            if (err < 0) {
+                node_release(res.node);
+                mutex_release(&fs_lock);
+                put_mount(res.mount);
+                return err;
+            }
+            vn = vnode_adopt_locked(res.mount, vn);
+            node_release(res.node);
+            mutex_release(&fs_lock);
+
+            f = malloc(sizeof(*f));
+            if (!f) {
+                vnode_put(vn);
+                put_mount(res.mount);
+                return ERR_NO_MEMORY;
+            }
+            f->vnode = vn;
+            f->mount = res.mount;
+            break;
+        }
+        default:
+            return res.err;
     }
 
-    if (!mount->api->create) {
-        put_mount(mount);
-        return ERR_NOT_SUPPORTED;
-    }
-
-    filecookie *cookie;
-    status_t err = mount->api->create(mount->cookie, newpath, &cookie, len);
-    if (err < 0) {
-        put_mount(mount);
-        return err;
-    }
-
-    filehandle *f = malloc(sizeof(*f));
-    if (!f) {
-        mount->api->close(cookie);
-        put_mount(mount);
-        return ERR_NO_MEMORY;
-    }
-    f->cookie = cookie;
-    f->mount = mount;
     *handle = f;
-
     return 0;
 }
 
-status_t fs_truncate_file(filehandle *handle, uint64_t len) {
-    LTRACEF("filehandle %p, length %llu\n", handle, len);
+status_t fs_make_dir(const char *path) {
+    char temppath[FS_MAX_PATH_LEN];
 
-    if (!handle->mount->api->truncate) {
-        return ERR_NOT_SUPPORTED;
+    strlcpy(temppath, path, sizeof(temppath));
+    fs_normalize_path(temppath);
+
+    struct fs_walk_result res;
+    fs_walk(temppath, FS_WALK_FLAG_PARENT, &res);
+
+    switch (res.kind) {
+        case FS_WALK_LEGACY: {
+            if (!res.mount->legacy_api->mkdir) {
+                put_mount(res.mount);
+                return ERR_NOT_SUPPORTED;
+            }
+
+            status_t err = res.mount->legacy_api->mkdir(res.mount->cookie, res.remainder);
+            put_mount(res.mount);
+            return err;
+        }
+        case FS_WALK_PARENT: {
+            if (!res.mount->api->mkdir) {
+                node_put(res.node);
+                put_mount(res.mount);
+                return ERR_NOT_SUPPORTED;
+            }
+
+            mutex_acquire(&fs_lock);
+            struct fs_vnode *vn;
+            status_t err = res.mount->api->mkdir(node_vnode(res.node), res.last, &vn);
+            if (err >= 0) {
+                vn = vnode_adopt_locked(res.mount, vn);
+                vnode_release_locked(vn);
+            }
+            node_release(res.node);
+            mutex_release(&fs_lock);
+            put_mount(res.mount);
+            return err;
+        }
+        default:
+            return res.err;
     }
+}
 
-    return handle->mount->api->truncate(handle->cookie, len);
+// shared with fs_remove_dir; expects the child to be of the given type and
+// dispatches to the matching filesystem op
+static status_t remove_common(char *temppath, bool dir) {
+    struct fs_walk_result res;
+    fs_walk(temppath, FS_WALK_FLAG_PARENT, &res);
+
+    switch (res.kind) {
+        case FS_WALK_LEGACY: {
+            status_t (*op)(fscookie *, const char *) =
+                dir ? res.mount->legacy_api->rmdir : res.mount->legacy_api->remove;
+            if (!op) {
+                put_mount(res.mount);
+                return ERR_NOT_SUPPORTED;
+            }
+
+            status_t err = op(res.mount->cookie, res.remainder);
+            put_mount(res.mount);
+            return err;
+        }
+        case FS_WALK_PARENT: {
+            status_t (*op)(struct fs_vnode *, const char *, struct fs_vnode *) =
+                dir ? res.mount->api->rmdir : res.mount->api->unlink;
+            if (!op) {
+                node_put(res.node);
+                put_mount(res.mount);
+                return ERR_NOT_SUPPORTED;
+            }
+
+            mutex_acquire(&fs_lock);
+
+            struct fs_vnode *dirvn = node_vnode(res.node);
+            status_t err;
+
+            // a node for the child can only exist here if something is
+            // enumerating or referencing it; refuse rather than surgery
+            struct fs_node *child = node_find_child(res.node, res.last, strlen(res.last));
+            if (child) {
+                err = ERR_BUSY;
+                goto out;
+            }
+
+            // resolve the child so it can be checked and passed to the fs
+            struct fs_vnode *cvn;
+            err = res.mount->api->lookup(dirvn, res.last, &cvn);
+            if (err < 0) {
+                goto out;
+            }
+            cvn = vnode_adopt_locked(res.mount, cvn);
+
+            if (dir && cvn->type != FS_VNODE_DIR) {
+                err = ERR_NOT_DIR;
+                vnode_release_locked(cvn);
+                goto out;
+            }
+            if (!dir && cvn->type == FS_VNODE_DIR) {
+                err = ERR_NOT_FILE;
+                vnode_release_locked(cvn);
+                goto out;
+            }
+
+            // the layer refuses to unlink anything with open handles: our
+            // transient reference is the only one a free object has
+            if (cvn->ref > 1) {
+                err = ERR_BUSY;
+                vnode_release_locked(cvn);
+                goto out;
+            }
+
+            err = op(dirvn, res.last, cvn);
+            vnode_release_locked(cvn);
+
+        out:
+            node_release(res.node);
+            mutex_release(&fs_lock);
+            put_mount(res.mount);
+            return err;
+        }
+        default:
+            return res.err;
+    }
 }
 
 status_t fs_remove_file(const char *path) {
@@ -564,22 +998,7 @@ status_t fs_remove_file(const char *path) {
     strlcpy(temppath, path, sizeof(temppath));
     fs_normalize_path(temppath);
 
-    const char *newpath;
-    struct fs_mount *mount = find_mount(temppath, &newpath);
-    if (!mount) {
-        return ERR_NOT_FOUND;
-    }
-
-    if (!mount->api->remove) {
-        put_mount(mount);
-        return ERR_NOT_SUPPORTED;
-    }
-
-    status_t err = mount->api->remove(mount->cookie, newpath);
-
-    put_mount(mount);
-
-    return err;
+    return remove_common(temppath, false);
 }
 
 status_t fs_remove_dir(const char *path) {
@@ -588,40 +1007,70 @@ status_t fs_remove_dir(const char *path) {
     strlcpy(temppath, path, sizeof(temppath));
     fs_normalize_path(temppath);
 
-    const char *newpath;
-    struct fs_mount *mount = find_mount(temppath, &newpath);
-    if (!mount) {
-        return ERR_NOT_FOUND;
+    return remove_common(temppath, true);
+}
+
+status_t fs_file_ioctl(filehandle *handle, int request, void *argp) {
+    LTRACEF("filehandle %p, request %d, argp, %p\n", handle, request, argp);
+
+    if (handle->mount->legacy_api) {
+        if (!handle->mount->legacy_api->file_ioctl) {
+            return ERR_NOT_SUPPORTED;
+        }
+        return handle->mount->legacy_api->file_ioctl(handle->cookie, request, argp);
     }
 
-    if (!mount->api->rmdir) {
-        put_mount(mount);
+    if (!handle->mount->api->ioctl) {
         return ERR_NOT_SUPPORTED;
     }
+    return handle->mount->api->ioctl(handle->vnode, request, argp);
+}
 
-    status_t err = mount->api->rmdir(mount->cookie, newpath);
+status_t fs_truncate_file(filehandle *handle, uint64_t len) {
+    LTRACEF("filehandle %p, length %llu\n", handle, len);
 
-    put_mount(mount);
+    if (handle->mount->legacy_api) {
+        if (!handle->mount->legacy_api->truncate) {
+            return ERR_NOT_SUPPORTED;
+        }
+        return handle->mount->legacy_api->truncate(handle->cookie, len);
+    }
 
-    return err;
+    if (!handle->mount->api->truncate) {
+        return ERR_NOT_SUPPORTED;
+    }
+    return handle->mount->api->truncate(handle->vnode, len);
 }
 
 ssize_t fs_read_file(filehandle *handle, void *buf, off_t offset, size_t len) {
-    return handle->mount->api->read(handle->cookie, buf, offset, len);
+    if (handle->mount->legacy_api) {
+        return handle->mount->legacy_api->read(handle->cookie, buf, offset, len);
+    }
+    return handle->mount->api->read(handle->vnode, buf, offset, len);
 }
 
 ssize_t fs_write_file(filehandle *handle, const void *buf, off_t offset, size_t len) {
+    if (handle->mount->legacy_api) {
+        if (!handle->mount->legacy_api->write) {
+            return ERR_NOT_SUPPORTED;
+        }
+        return handle->mount->legacy_api->write(handle->cookie, buf, offset, len);
+    }
+
     if (!handle->mount->api->write) {
         return ERR_NOT_SUPPORTED;
     }
-
-    return handle->mount->api->write(handle->cookie, buf, offset, len);
+    return handle->mount->api->write(handle->vnode, buf, offset, len);
 }
 
 status_t fs_close_file(filehandle *handle) {
-    status_t err = handle->mount->api->close(handle->cookie);
-    if (err < 0) {
-        return err;
+    if (handle->mount->legacy_api) {
+        status_t err = handle->mount->legacy_api->close(handle->cookie);
+        if (err < 0) {
+            return err;
+        }
+    } else {
+        vnode_put(handle->vnode);
     }
 
     put_mount(handle->mount);
@@ -633,31 +1082,15 @@ status_t fs_stat_file(filehandle *handle, struct file_stat *stat) {
     // zero the struct so fields a filesystem does not fill in (e.g. capacity)
     // read as zero instead of stack garbage
     memset(stat, 0, sizeof(*stat));
-    return handle->mount->api->stat(handle->cookie, stat);
-}
 
-status_t fs_make_dir(const char *path) {
-    char temppath[FS_MAX_PATH_LEN];
-
-    strlcpy(temppath, path, sizeof(temppath));
-    fs_normalize_path(temppath);
-
-    const char *newpath;
-    struct fs_mount *mount = find_mount(temppath, &newpath);
-    if (!mount) {
-        return ERR_NOT_FOUND;
+    if (handle->mount->legacy_api) {
+        return handle->mount->legacy_api->stat(handle->cookie, stat);
     }
 
-    if (!mount->api->mkdir) {
-        put_mount(mount);
+    if (!handle->mount->api->stat) {
         return ERR_NOT_SUPPORTED;
     }
-
-    status_t err = mount->api->mkdir(mount->cookie, newpath);
-
-    put_mount(mount);
-
-    return err;
+    return handle->mount->api->stat(handle->vnode, stat);
 }
 
 // ---------------------------------------------------------------------------
@@ -714,60 +1147,93 @@ status_t fs_open_dir(const char *path, dirhandle **handle) {
 
     LTRACEF("path %s temppath %s\n", path, temppath);
 
-    struct fs_mount *mount;
-    struct fs_node *node;
-    const char *newpath;
+    struct fs_walk_result res;
+    fs_walk(temppath, 0, &res);
 
-    switch (fs_resolve(temppath, &mount, &newpath, &node)) {
-        case FS_RESOLVE_MOUNT:
-            break;
-        case FS_RESOLVE_NODE: {
-            // a directory of the mount namespace itself
-            struct scaffold_dircookie *dc;
-            status_t err = scaffold_opendir(node, &dc);
+    dirhandle *d;
+    switch (res.kind) {
+        case FS_WALK_LEGACY: {
+            if (!res.mount->legacy_api->opendir) {
+                put_mount(res.mount);
+                return ERR_NOT_SUPPORTED;
+            }
+
+            dircookie *cookie;
+            status_t err = res.mount->legacy_api->opendir(res.mount->cookie, res.remainder, &cookie);
             if (err < 0) {
-                node_put(node);
+                put_mount(res.mount);
                 return err;
             }
 
-            dirhandle *d = malloc(sizeof(*d));
+            d = malloc(sizeof(*d));
             if (!d) {
-                scaffold_closedir(dc);
+                res.mount->legacy_api->closedir(cookie);
+                put_mount(res.mount);
                 return ERR_NO_MEMORY;
             }
-            d->cookie = (dircookie *)dc;
-            d->mount = NULL; // sentinel: scaffold handle
-            *handle = d;
-            return NO_ERROR;
+            d->cookie = cookie;
+            d->mount = res.mount;
+            d->vnode = NULL;
+            break;
+        }
+        case FS_WALK_NODE: {
+            if (!res.mount) {
+                // a directory of the mount namespace itself
+                struct scaffold_dircookie *dc;
+                status_t err = scaffold_opendir(res.node, &dc);
+                if (err < 0) {
+                    node_put(res.node);
+                    return err;
+                }
+
+                d = malloc(sizeof(*d));
+                if (!d) {
+                    scaffold_closedir(dc);
+                    return ERR_NO_MEMORY;
+                }
+                d->cookie = (dircookie *)dc;
+                d->mount = NULL; // sentinel: scaffold handle
+                d->vnode = NULL;
+                break;
+            }
+
+            struct fs_vnode *vn = walk_node_to_vnode(res.node);
+            if (vn->type != FS_VNODE_DIR) {
+                vnode_put(vn);
+                put_mount(res.mount);
+                return ERR_NOT_DIR;
+            }
+            if (!res.mount->api->opendir) {
+                vnode_put(vn);
+                put_mount(res.mount);
+                return ERR_NOT_SUPPORTED;
+            }
+
+            dircookie *cookie;
+            status_t err = res.mount->api->opendir(vn, &cookie);
+            if (err < 0) {
+                vnode_put(vn);
+                put_mount(res.mount);
+                return err;
+            }
+
+            d = malloc(sizeof(*d));
+            if (!d) {
+                res.mount->api->closedir(cookie);
+                vnode_put(vn);
+                put_mount(res.mount);
+                return ERR_NO_MEMORY;
+            }
+            d->cookie = cookie;
+            d->mount = res.mount;
+            d->vnode = vn;
+            break;
         }
         default:
-            return ERR_NOT_FOUND;
+            return res.err;
     }
 
-    LTRACEF("path %s temppath %s newpath %s\n", path, temppath, newpath);
-
-    if (!mount->api->opendir) {
-        put_mount(mount);
-        return ERR_NOT_SUPPORTED;
-    }
-
-    dircookie *cookie;
-    status_t err = mount->api->opendir(mount->cookie, newpath, &cookie);
-    if (err < 0) {
-        put_mount(mount);
-        return err;
-    }
-
-    dirhandle *d = malloc(sizeof(*d));
-    if (!d) {
-        mount->api->closedir(cookie);
-        put_mount(mount);
-        return ERR_NO_MEMORY;
-    }
-    d->cookie = cookie;
-    d->mount = mount;
     *handle = d;
-
     return 0;
 }
 
@@ -776,8 +1242,11 @@ status_t fs_read_dir(dirhandle *handle, struct dirent *ent) {
         return scaffold_readdir((struct scaffold_dircookie *)handle->cookie, ent);
     }
 
-    if (!handle->mount->api->readdir) {
-        return ERR_NOT_SUPPORTED;
+    if (handle->mount->legacy_api) {
+        if (!handle->mount->legacy_api->readdir) {
+            return ERR_NOT_SUPPORTED;
+        }
+        return handle->mount->legacy_api->readdir(handle->cookie, ent);
     }
 
     return handle->mount->api->readdir(handle->cookie, ent);
@@ -790,13 +1259,17 @@ status_t fs_close_dir(dirhandle *handle) {
         return NO_ERROR;
     }
 
-    if (!handle->mount->api->closedir) {
-        return ERR_NOT_SUPPORTED;
-    }
-
-    status_t err = handle->mount->api->closedir(handle->cookie);
-    if (err < 0) {
-        return err;
+    if (handle->mount->legacy_api) {
+        if (!handle->mount->legacy_api->closedir) {
+            return ERR_NOT_SUPPORTED;
+        }
+        status_t err = handle->mount->legacy_api->closedir(handle->cookie);
+        if (err < 0) {
+            return err;
+        }
+    } else {
+        handle->mount->api->closedir(handle->cookie);
+        vnode_put(handle->vnode);
     }
 
     put_mount(handle->mount);
@@ -812,18 +1285,35 @@ status_t fs_stat_fs(const char *mountpoint, struct fs_stat *stat) {
     strlcpy(temppath, mountpoint, sizeof(temppath));
     fs_normalize_path(temppath);
 
-    struct fs_mount *mount = find_mount(temppath, NULL);
-    if (!mount) {
-        return ERR_NOT_FOUND;
+    struct fs_mount *mount;
+    struct fs_walk_result res;
+    fs_walk(temppath, 0, &res);
+
+    switch (res.kind) {
+        case FS_WALK_LEGACY:
+            mount = res.mount;
+            break;
+        case FS_WALK_NODE:
+            if (!res.mount) {
+                node_put(res.node);
+                return ERR_NOT_FOUND;
+            }
+            mount = res.mount;
+            node_put(res.node);
+            break;
+        default:
+            return res.err;
     }
 
-    if (!mount->api->fs_stat) {
+    status_t (*fs_stat_op)(fscookie *, struct fs_stat *) =
+        mount->legacy_api ? mount->legacy_api->fs_stat : mount->api->fs_stat;
+    if (!fs_stat_op) {
         put_mount(mount);
         return ERR_NOT_SUPPORTED;
     }
 
     memset(stat, 0, sizeof(*stat));
-    status_t result = mount->api->fs_stat(mount->cookie, stat);
+    status_t result = fs_stat_op(mount->cookie, stat);
 
     put_mount(mount);
 

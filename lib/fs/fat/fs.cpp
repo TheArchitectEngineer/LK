@@ -529,7 +529,7 @@ status_t fat_fs::unmount(fscookie *cookie) {
     return NO_ERROR;
 }
 
-static const struct fs_api fat_api = {
+static const struct fs_legacy_api fat_api = {
     .format = fat_fs::format,
     .fs_stat = fat_fs::fs_stat,
 
@@ -553,4 +553,4 @@ static const struct fs_api fat_api = {
     .file_ioctl = nullptr,
 };
 
-STATIC_FS_IMPL(fat, &fat_api);
+STATIC_FS_IMPL_LEGACY(fat, &fat_api);

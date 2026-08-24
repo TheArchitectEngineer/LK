@@ -8,6 +8,7 @@
 #pragma once
 
 #include <lk/compiler.h>
+#include <lk/list.h>
 #include <stdbool.h>
 #include <sys/types.h>
 
@@ -85,7 +86,78 @@ typedef struct filecookie filecookie;
 typedef struct dircookie dircookie;
 struct bdev;
 
+/* The vnode interface: the fs layer owns path resolution and hands each
+ * filesystem one component at a time, always relative to a directory vnode.
+ * See lib/fs/plan.md for the design. */
+
+enum fs_vnode_type {
+    FS_VNODE_FILE = 0,
+    FS_VNODE_DIR,
+    FS_VNODE_SYMLINK,
+};
+
+/* One filesystem object (file, directory, symlink). Allocated by the layer on
+ * the filesystem's behalf via fs_vnode_create(); the filesystem owns priv and
+ * fills id/type, the layer owns everything else including the lifetime: when
+ * the last reference is dropped the release() op runs and the vnode is freed. */
+struct fs_vnode {
+    // layer owned
+    struct list_node node;    // in the mount's live vnode list
+    struct fs_mount *mount;
+    int ref;
+
+    // filesystem provided
+    fscookie *cookie;         // the filesystem instance this vnode belongs to (layer filled)
+    uint64_t id;              // stable identity for deduplication, 0 = none
+    uint8_t type;             // enum fs_vnode_type
+    void *priv;               // filesystem private per-object state
+};
+
+/* Allocate a vnode to return from mount/lookup/create/mkdir. The filesystem
+ * must return a fresh vnode from each call; the layer deduplicates by id. */
+status_t fs_vnode_create(uint64_t id, enum fs_vnode_type type, void *priv,
+                         struct fs_vnode **out) __NONNULL((4));
+
 struct fs_api {
+    // volume ops
+    status_t (*format)(struct bdev *, const void *args);
+    status_t (*mount)(struct bdev *, enum fs_mount_options options, fscookie **,
+                      struct fs_vnode **root);
+    status_t (*unmount)(fscookie *);
+    status_t (*fs_stat)(fscookie *, struct fs_stat *);
+
+    // namespace ops: always one component, always relative to a directory vnode.
+    // unlink/rmdir receive the child so the fs can refuse or invalidate it; the
+    // layer has already refused if the child has open handles.
+    status_t (*lookup)(struct fs_vnode *dir, const char *name, struct fs_vnode **out);
+    status_t (*create)(struct fs_vnode *dir, const char *name, uint64_t len,
+                       struct fs_vnode **out);
+    status_t (*mkdir)(struct fs_vnode *dir, const char *name, struct fs_vnode **out);
+    status_t (*unlink)(struct fs_vnode *dir, const char *name, struct fs_vnode *child);
+    status_t (*rmdir)(struct fs_vnode *dir, const char *name, struct fs_vnode *child);
+    status_t (*rename)(struct fs_vnode *olddir, const char *oldname, struct fs_vnode *child,
+                       struct fs_vnode *newdir, const char *newname); // optional
+    ssize_t (*readlink)(struct fs_vnode *link, char *buf, size_t len); // optional
+    void (*release)(struct fs_vnode *); // last reference dropped
+
+    // file ops, directly on the vnode (reads and writes carry the offset, so
+    // there is no per-open state and no open/close pair)
+    ssize_t (*read)(struct fs_vnode *, void *, off_t, size_t);
+    ssize_t (*write)(struct fs_vnode *, const void *, off_t, size_t);
+    status_t (*truncate)(struct fs_vnode *, uint64_t);
+    status_t (*stat)(struct fs_vnode *, struct file_stat *);
+    status_t (*ioctl)(struct fs_vnode *, int, void *);
+
+    // directory enumeration needs a cursor, so it keeps a cookie.
+    // readdir reports end-of-directory as ERR_NOT_FOUND.
+    status_t (*opendir)(struct fs_vnode *, dircookie **);
+    status_t (*readdir)(dircookie *, struct dirent *);
+    status_t (*closedir)(dircookie *);
+};
+
+/* The legacy string-path interface: each filesystem resolves whole paths
+ * itself. Being replaced by the vnode api above, one filesystem at a time. */
+struct fs_legacy_api {
     status_t (*format)(struct bdev *, const void *);
     status_t (*fs_stat)(fscookie *, struct fs_stat *);
 
@@ -111,12 +183,16 @@ struct fs_api {
 
 struct fs_impl {
     const char *name;
-    const struct fs_api *api;
+    const struct fs_api *api;               // vnode interface
+    const struct fs_legacy_api *legacy_api; // string-path interface
 };
 
 /* define in your fs implementation to register your api with the fs layer */
 #define STATIC_FS_IMPL(_name, _api) const struct fs_impl __fs_impl_##_name __ALIGNED(sizeof(void *)) __SECTION("fs_impl") = \
                                         {.name = #_name, .api = _api}
+
+#define STATIC_FS_IMPL_LEGACY(_name, _api) const struct fs_impl __fs_impl_##_name __ALIGNED(sizeof(void *)) __SECTION("fs_impl") = \
+                                        {.name = #_name, .legacy_api = _api}
 
 /* list all registered file systems */
 void fs_dump_list(void);

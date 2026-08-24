@@ -428,7 +428,7 @@ static status_t memfs_closedir(dircookie *dcookie) {
     return NO_ERROR;
 }
 
-static const struct fs_api memfs_api = {
+static const struct fs_legacy_api memfs_api = {
     .mount = memfs_mount,
     .unmount = memfs_unmount,
 
@@ -452,4 +452,4 @@ static const struct fs_api memfs_api = {
 
 };
 
-STATIC_FS_IMPL(memfs, &memfs_api);
+STATIC_FS_IMPL_LEGACY(memfs, &memfs_api);

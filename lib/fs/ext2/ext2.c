@@ -265,7 +265,7 @@ int ext2_load_inode(ext2_t *ext2, inodenum_t num, struct ext2_inode *inode) {
     return 0;
 }
 
-static const struct fs_api ext2_api = {
+static const struct fs_legacy_api ext2_api = {
     .mount = ext2_mount,
     .unmount = ext2_unmount,
     .open = ext2_open_file,
@@ -274,4 +274,4 @@ static const struct fs_api ext2_api = {
     .close = ext2_close_file,
 };
 
-STATIC_FS_IMPL(ext2, &ext2_api);
+STATIC_FS_IMPL_LEGACY(ext2, &ext2_api);

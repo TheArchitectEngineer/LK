@@ -1232,7 +1232,7 @@ static status_t spifs_file_ioctl(filecookie *cookie, int request, void *argp) {
     return ERR_NOT_SUPPORTED;
 }
 
-static const struct fs_api spifs_api = {
+static const struct fs_legacy_api spifs_api = {
     .format = spifs_format,
     .fs_stat = spifs_fs_stat,
 
@@ -1257,4 +1257,4 @@ static const struct fs_api spifs_api = {
     .closedir = spifs_closedir,
 };
 
-STATIC_FS_IMPL(spifs, &spifs_api);
+STATIC_FS_IMPL_LEGACY(spifs, &spifs_api);
