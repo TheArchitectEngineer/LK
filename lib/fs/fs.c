@@ -382,10 +382,52 @@ struct fs_walk_result {
 
 #define FS_WALK_FLAG_PARENT 0x1
 
-// Walk a normalized path (which the walk may temporarily poke NUL terminators
-// into) through the tree, asking vnode-interface filesystems to resolve one
-// component at a time.
-static void fs_walk(char *path, uint flags, struct fs_walk_result *res) {
+// How many symlinks one walk may follow before giving up, which is what bounds
+// a loop.
+#define FS_MAX_SYMLINK_DEPTH 8
+
+// Rewrite path in place, replacing the symlink component starting at comp
+// (with rest naming everything after it) by the link's target, and renormalize
+// the result. An absolute target drops the whole prefix, so it resolves
+// against the mount namespace root rather than the filesystem's own root; the
+// caller restarts the walk from the root either way, which is also what makes
+// ".." inside a target behave lexically like it does anywhere else.
+static status_t walk_splice_symlink(char *path, size_t path_size, const char *comp,
+                                    const char *rest, struct fs_vnode *link) {
+    if (!link->mount->api->readlink) {
+        return ERR_NOT_SUPPORTED;
+    }
+
+    char target[FS_MAX_PATH_LEN];
+    ssize_t tlen = link->mount->api->readlink(link, target, sizeof(target));
+    if (tlen < 0) {
+        return (status_t)tlen;
+    }
+    if (tlen == 0) {
+        // a link to nowhere names nothing
+        return ERR_NOT_FOUND;
+    }
+
+    size_t prefix_len = (target[0] == '/') ? 0 : (size_t)(comp - path);
+    size_t rest_len = strlen(rest);
+    if (prefix_len + (size_t)tlen + rest_len + 1 > path_size) {
+        return ERR_NOT_ENOUGH_BUFFER;
+    }
+
+    // move the tail out to its new place first, since it overlaps the target
+    memmove(path + prefix_len + tlen, rest, rest_len + 1);
+    memcpy(path + prefix_len, target, tlen);
+    fs_normalize_path(path);
+
+    return NO_ERROR;
+}
+
+// Walk a normalized path through the tree, asking vnode-interface filesystems
+// to resolve one component at a time. The buffer is scratch: the walk pokes
+// temporary NUL terminators into it, and following a symlink rewrites it
+// outright, so a caller that needs the path afterwards must keep its own copy.
+// Result pointers (remainder, last) point into it and stay valid until then.
+static void fs_walk(char *path, size_t path_size, uint flags, struct fs_walk_result *res) {
     memset(res, 0, sizeof(*res));
     res->kind = FS_WALK_FAILED;
     res->err = ERR_NOT_FOUND;
@@ -401,6 +443,7 @@ static void fs_walk(char *path, uint flags, struct fs_walk_result *res) {
     struct fs_node *cur = &fs_root;
     cur->ref++;
     char *pos = path; // always at a '/' or the terminator
+    uint symlink_depth = 0;
 
     for (;;) {
         // entering a legacy mount hands the rest of the path to the filesystem
@@ -510,6 +553,30 @@ static void fs_walk(char *path, uint flags, struct fs_walk_result *res) {
             child->vnode = vn; // the node owns this reference
         }
 
+        // a symlink names something else: splice its target into the path and
+        // start over from the root
+        struct fs_vnode *childvn = node_vnode(child);
+        if (childvn && childvn->type == FS_VNODE_SYMLINK) {
+            status_t err;
+            if (++symlink_depth > FS_MAX_SYMLINK_DEPTH) {
+                err = ERR_RECURSE_TOO_DEEP;
+            } else {
+                err = walk_splice_symlink(path, path_size, comp, rest, childvn);
+            }
+            node_release(child);
+            node_release(cur);
+            if (err < 0) {
+                mutex_release(&fs_lock);
+                res->err = err;
+                return;
+            }
+
+            cur = &fs_root;
+            cur->ref++;
+            pos = path;
+            continue;
+        }
+
         node_release(cur);
         cur = child;
         pos = rest;
@@ -529,17 +596,17 @@ static struct fs_vnode *walk_node_to_vnode(struct fs_node *node) {
     return vn;
 }
 
-// find the mount a path leads into and the remainder of the path for the
-// filesystem to resolve; takes a reference on the mount. legacy only.
-static struct fs_mount *find_mount(char *path, const char **trimmed_path) {
+// find the mount a path leads into; takes a reference on it. The walk owns
+// its buffer, so this makes a private copy of the caller's normalized path.
+static struct fs_mount *find_mount(const char *path) {
+    char temppath[FS_MAX_PATH_LEN];
+    strlcpy(temppath, path, sizeof(temppath));
+
     struct fs_walk_result res;
-    fs_walk(path, 0, &res);
+    fs_walk(temppath, sizeof(temppath), 0, &res);
 
     switch (res.kind) {
         case FS_WALK_LEGACY:
-            if (trimmed_path) {
-                *trimmed_path = res.remainder;
-            }
             return res.mount;
         case FS_WALK_NODE:
             node_put(res.node);
@@ -616,7 +683,7 @@ static status_t mount(const char *path, const char *device, const struct fs_impl
     }
 
     /* see if there's already something at (or above) this path, abort if there is */
-    mount = find_mount(temppath, NULL);
+    mount = find_mount(temppath);
     if (mount) {
         put_mount(mount);
         return ERR_ALREADY_MOUNTED;
@@ -798,7 +865,7 @@ status_t fs_unmount(const char *path) {
     fs_normalize_path(temppath);
 
     struct fs_walk_result res;
-    fs_walk(temppath, 0, &res);
+    fs_walk(temppath, sizeof(temppath), 0, &res);
 
     struct fs_mount *mount;
     switch (res.kind) {
@@ -843,7 +910,7 @@ status_t fs_open_file(const char *path, filehandle **handle) {
     LTRACEF("path %s temppath %s\n", path, temppath);
 
     struct fs_walk_result res;
-    fs_walk(temppath, 0, &res);
+    fs_walk(temppath, sizeof(temppath), 0, &res);
 
     filehandle *f;
     switch (res.kind) {
@@ -898,7 +965,7 @@ status_t fs_create_file(const char *path, filehandle **handle, uint64_t len) {
     fs_normalize_path(temppath);
 
     struct fs_walk_result res;
-    fs_walk(temppath, FS_WALK_FLAG_PARENT, &res);
+    fs_walk(temppath, sizeof(temppath), FS_WALK_FLAG_PARENT, &res);
 
     filehandle *f;
     switch (res.kind) {
@@ -970,7 +1037,7 @@ status_t fs_make_dir(const char *path) {
     fs_normalize_path(temppath);
 
     struct fs_walk_result res;
-    fs_walk(temppath, FS_WALK_FLAG_PARENT, &res);
+    fs_walk(temppath, sizeof(temppath), FS_WALK_FLAG_PARENT, &res);
 
     switch (res.kind) {
         case FS_WALK_LEGACY: {
@@ -1009,9 +1076,14 @@ status_t fs_make_dir(const char *path) {
 
 // shared with fs_remove_dir; expects the child to be of the given type and
 // dispatches to the matching filesystem op
-static status_t remove_common(char *temppath, bool dir) {
+static status_t remove_common(const char *path, bool dir) {
+    char temppath[FS_MAX_PATH_LEN];
+
+    strlcpy(temppath, path, sizeof(temppath));
+    fs_normalize_path(temppath);
+
     struct fs_walk_result res;
-    fs_walk(temppath, FS_WALK_FLAG_PARENT, &res);
+    fs_walk(temppath, sizeof(temppath), FS_WALK_FLAG_PARENT, &res);
 
     switch (res.kind) {
         case FS_WALK_LEGACY: {
@@ -1100,21 +1172,11 @@ static status_t remove_common(char *temppath, bool dir) {
 }
 
 status_t fs_remove_file(const char *path) {
-    char temppath[FS_MAX_PATH_LEN];
-
-    strlcpy(temppath, path, sizeof(temppath));
-    fs_normalize_path(temppath);
-
-    return remove_common(temppath, false);
+    return remove_common(path, false);
 }
 
 status_t fs_remove_dir(const char *path) {
-    char temppath[FS_MAX_PATH_LEN];
-
-    strlcpy(temppath, path, sizeof(temppath));
-    fs_normalize_path(temppath);
-
-    return remove_common(temppath, true);
+    return remove_common(path, true);
 }
 
 status_t fs_file_ioctl(filehandle *handle, int request, void *argp) {
@@ -1255,7 +1317,7 @@ status_t fs_open_dir(const char *path, dirhandle **handle) {
     LTRACEF("path %s temppath %s\n", path, temppath);
 
     struct fs_walk_result res;
-    fs_walk(temppath, 0, &res);
+    fs_walk(temppath, sizeof(temppath), 0, &res);
 
     dirhandle *d;
     switch (res.kind) {
@@ -1394,7 +1456,7 @@ status_t fs_stat_fs(const char *mountpoint, struct fs_stat *stat) {
 
     struct fs_mount *mount;
     struct fs_walk_result res;
-    fs_walk(temppath, 0, &res);
+    fs_walk(temppath, sizeof(temppath), 0, &res);
 
     switch (res.kind) {
         case FS_WALK_LEGACY:
