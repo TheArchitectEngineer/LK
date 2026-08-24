@@ -178,6 +178,120 @@ static bool test_remove_while_open(void) {
     END_TEST;
 }
 
+#define FLAT_MNT "/fs_flat_test"
+
+static void test_flat_fs_semantics_teardown(void *ptr) {
+    fs_unmount(FLAT_MNT);
+}
+
+// Pin down the contract a flat (no-directory) filesystem presents through the
+// fs layer, using memfs as the reference: directory-shaped requests are
+// ERR_NOT_SUPPORTED, missing names are ERR_NOT_FOUND, and the mount root is
+// the one openable directory.
+static bool test_flat_fs_semantics(void) {
+    __attribute__((cleanup(test_flat_fs_semantics_teardown))) BEGIN_TEST;
+
+    ASSERT_EQ(NO_ERROR, fs_mount(FLAT_MNT, "memfs", NULL, FS_MOUNT_OPTION_NONE), "mount");
+
+    // no subdirectory support: mkdir and nested create are not supported
+    filehandle *h;
+    EXPECT_EQ(ERR_NOT_SUPPORTED, fs_make_dir(FLAT_MNT "/sub"), "mkdir on flat fs");
+    EXPECT_EQ(ERR_NOT_SUPPORTED, fs_create_file(FLAT_MNT "/sub/file", &h, 0), "nested create");
+
+    // a name that simply does not exist is ERR_NOT_FOUND, not ERR_NOT_SUPPORTED
+    EXPECT_EQ(ERR_NOT_FOUND, fs_open_file(FLAT_MNT "/nope", &h), "open missing file");
+    dirhandle *dh;
+    EXPECT_EQ(ERR_NOT_FOUND, fs_open_dir(FLAT_MNT "/nope", &dh), "open missing dir");
+
+    // the root of the mount is openable as a directory
+    ASSERT_EQ(NO_ERROR, fs_open_dir(FLAT_MNT, &dh), "open mount root");
+    EXPECT_EQ(NO_ERROR, fs_close_dir(dh), "close mount root");
+
+    END_TEST;
+}
+
+#define DIR_MNT "/fs_readdir_test"
+
+static void test_readdir_teardown(void *ptr) {
+    fs_remove_file(DIR_MNT "/a");
+    fs_remove_file(DIR_MNT "/b");
+    fs_remove_file(DIR_MNT "/c");
+    fs_unmount(DIR_MNT);
+}
+
+static bool test_readdir(void) {
+    __attribute__((cleanup(test_readdir_teardown))) BEGIN_TEST;
+
+    ASSERT_EQ(NO_ERROR, fs_mount(DIR_MNT, "memfs", NULL, FS_MOUNT_OPTION_NONE), "mount");
+
+    const char *names[] = { DIR_MNT "/a", DIR_MNT "/b", DIR_MNT "/c" };
+    for (size_t i = 0; i < countof(names); i++) {
+        filehandle *h;
+        ASSERT_EQ(NO_ERROR, fs_create_file(names[i], &h, 0), "create");
+        ASSERT_EQ(NO_ERROR, fs_close_file(h), "close");
+    }
+
+    dirhandle *dh;
+    ASSERT_EQ(NO_ERROR, fs_open_dir(DIR_MNT, &dh), "open dir");
+    bool seen[countof(names)] = {};
+    size_t entries = 0;
+    struct dirent ent;
+    while (fs_read_dir(dh, &ent) == NO_ERROR) {
+        entries++;
+        if (!strcmp(ent.name, "a")) seen[0] = true;
+        if (!strcmp(ent.name, "b")) seen[1] = true;
+        if (!strcmp(ent.name, "c")) seen[2] = true;
+    }
+    EXPECT_EQ(3u, entries, "entry count");
+    EXPECT_TRUE(seen[0] && seen[1] && seen[2], "every created file enumerated");
+
+    // end of directory is ERR_NOT_FOUND, and stays that way on a re-read
+    EXPECT_EQ(ERR_NOT_FOUND, fs_read_dir(dh, &ent), "eof");
+    EXPECT_EQ(ERR_NOT_FOUND, fs_read_dir(dh, &ent), "eof is stable");
+    EXPECT_EQ(NO_ERROR, fs_close_dir(dh), "close dir");
+
+    END_TEST;
+}
+
+#define UMNT_MNT  "/fs_unmount_test"
+#define UMNT_FILE UMNT_MNT "/file"
+
+static void test_unmount_with_open_handle_teardown(void *ptr) {
+    fs_remove_file(UMNT_FILE);
+    fs_unmount(UMNT_MNT);
+}
+
+// Unmounting with a handle still open must never free the filesystem under
+// the handle. Today the layer defers the teardown until the last close and
+// returns NO_ERROR; a future version may refuse with ERR_BUSY instead. Either
+// way the handle stays usable and the mount is gone once both the close and a
+// (possibly second) unmount have happened.
+static bool test_unmount_with_open_handle(void) {
+    __attribute__((cleanup(test_unmount_with_open_handle_teardown))) BEGIN_TEST;
+
+    ASSERT_EQ(NO_ERROR, fs_mount(UMNT_MNT, "memfs", NULL, FS_MOUNT_OPTION_NONE), "mount");
+
+    filehandle *h;
+    ASSERT_EQ(NO_ERROR, fs_create_file(UMNT_FILE, &h, 16), "create");
+
+    status_t err = fs_unmount(UMNT_MNT);
+    EXPECT_TRUE(err == NO_ERROR || err == ERR_BUSY, "unmount with open handle");
+
+    // the handle must still work
+    char buf[16];
+    EXPECT_EQ(16, fs_read_file(h, buf, 0, sizeof(buf)), "read after unmount attempt");
+    EXPECT_EQ(NO_ERROR, fs_close_file(h), "close");
+
+    // after the last close the mount can be (or already has been) torn down
+    err = fs_unmount(UMNT_MNT);
+    EXPECT_TRUE(err == NO_ERROR || err == ERR_NOT_FOUND, "final unmount");
+
+    // and the path is really gone
+    EXPECT_EQ(ERR_NOT_FOUND, fs_open_file(UMNT_FILE, &h), "open after unmount");
+
+    END_TEST;
+}
+
 static void test_rootfs_teardown(void *ptr) {
     fs_unmount("/tmp");
     fs_unmount("/data");
@@ -280,6 +394,9 @@ BEGIN_TEST_CASE(fs_tests);
 RUN_TEST(test_path_normalize);
 RUN_TEST(test_stdio_fs);
 RUN_TEST(test_remove_while_open);
+RUN_TEST(test_flat_fs_semantics);
+RUN_TEST(test_readdir);
+RUN_TEST(test_unmount_with_open_handle);
 RUN_TEST(test_rootfs);
 RUN_TEST(test_rootfs_live_iter);
 END_TEST_CASE(fs_tests);
