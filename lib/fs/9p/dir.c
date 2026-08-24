@@ -156,8 +156,13 @@ status_t v9fs_mkdir(fscookie *cookie, const char *path) {
 
     // separate the directory and the dirname
     dirname = strrchr(temppath, '/');
-    if (!dirname || dirname == temppath) { // create on the root dir
+    if (!dirname) { // create on the root dir, name came in with no leading /
         dirname = temppath;
+        twalk.msg.twalk.nwname = 0;
+    } else if (dirname == temppath) { // create on the root dir ("/name")
+        // skip the leading /, or the server is asked to create a directory
+        // literally named "/name"
+        dirname++;
         twalk.msg.twalk.nwname = 0;
     } else { // create on a dir
         // parse the parent directory

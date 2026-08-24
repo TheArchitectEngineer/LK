@@ -23,6 +23,7 @@
  */
 #include <dev/virtio/9p.h>
 
+#include <assert.h>
 #include <kernel/mutex.h>
 #include <lib/fs.h>
 #include <lk/err.h>
@@ -153,6 +154,11 @@ status_t v9fs_unmount(fscookie *cookie) {
     LTRACEF("v9fs (%p)\n", v9fs);
 
     if (v9fs) {
+        // the fs layer only unmounts once the last handle is closed, so the
+        // handle lists must already be empty; the root fid is ours to clunk
+        DEBUG_ASSERT(list_is_empty(&v9fs->files));
+        DEBUG_ASSERT(list_is_empty(&v9fs->dirs));
+        put_fid(v9fs, v9fs->root.fid);
         free(v9fs);
     }
 

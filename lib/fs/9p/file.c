@@ -154,8 +154,13 @@ status_t v9fs_create_file(fscookie *cookie, const char *path,
 
     // separate the directory and the filename
     filename = strrchr(temppath, '/');
-    if (!filename || filename == temppath) { // create on the root dir
+    if (!filename) { // create on the root dir, name came in with no leading /
         filename = temppath;
+        twalk.msg.twalk.nwname = 0;
+    } else if (filename == temppath) { // create on the root dir ("/name")
+        // skip the leading /, or the server is asked to create a file
+        // literally named "/name"
+        filename++;
         twalk.msg.twalk.nwname = 0;
     } else { // create on a dir
         // parse the parent directory
@@ -483,7 +488,8 @@ status_t v9fs_stat_file(filecookie *fcookie, struct file_stat *stat) {
     virtio_9p_msg_t rgatt = {};
 
     if ((ret = virtio_9p_rpc(file->v9fs->dev, &tgatt, &rgatt)) != NO_ERROR) {
-        return ret;
+        // rgatt is still zero initialized, so the destroy below is a no-op
+        goto err;
     }
     if (rgatt.msg_type != P9_RGETATTR) {
         ret = ERR_BUSY;
