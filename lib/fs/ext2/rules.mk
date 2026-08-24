@@ -7,6 +7,8 @@ MODULE_DEPS += \
 	lib/bcache \
 	lib/bio
 
+MODULE_OPTIONS := test
+
 MODULE_SRCS += \
 	$(LOCAL_DIR)/ext2.c \
 	$(LOCAL_DIR)/dir.c \
