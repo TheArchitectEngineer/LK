@@ -94,11 +94,20 @@ implementation:
   touches every filesystem for a cost only the first open pays
 - 9p's fids come from a bitmap over a fixed range (512) rather than a
   counter, so they are recycled; a mount that exhausts them fails the lookup
-  with ERR_NO_RESOURCES rather than reusing a live one
+  with ERR_NO_RESOURCES rather than reusing a live one. Recycling makes it
+  matter *why* a request failed: a reply of any kind, Rlerror included,
+  proves the server processed it and released the fid, but a transport
+  timeout leaves that unknown, so such a number is abandoned rather than
+  handed out again into a possible collision
+- 9p sizes each read and write by the iounit the server reports when the fid
+  is opened, falling back to PAGE_SIZE when it reports none. qemu answers
+  about 124KB for a file and zero for a directory, so a large transfer is one
+  round trip instead of one per page -- and on a 64K page target the chunk
+  stops being larger than what the server asked for
 - qid.path is assumed unique across the share, which is what dedup keys on.
   It is not, for a share that spans devices (qemu's multidevs=), where two
   files on different devices would collapse into one vnode
-- §5 costed the 9p conversion at +150 bytes; it measures −448 (5,255 → 4,807
+- §5 costed the 9p conversion at +150 bytes; it measures −192 (5,255 → 5,063
   text, arm64 DEBUG=0), and a vnode is ~24 bytes of heap where an open file
   used to cost more than 4KB. The core is untouched by this phase: fs.c is
   byte-identical, so the §1 budget stands where Phase 3 left it
