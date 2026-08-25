@@ -67,12 +67,44 @@ status_t path_to_wname(char *path, uint16_t *nwname,
 
 uint32_t get_unused_fid(v9fs_t *v9fs) {
     mutex_acquire(&v9fs->lock);
-    uint32_t fid = v9fs->unused_fid++;
+
+    // scan from the hint so a steady open/close cycle does not rescan the
+    // used prefix on every allocation
+    for (uint32_t i = 0; i < V9FS_MAX_FIDS; i++) {
+        uint32_t fid = (v9fs->fid_hint + i) % V9FS_MAX_FIDS;
+        uint32_t *word = &v9fs->fid_map[fid / 32];
+        uint32_t bit = 1u << (fid % 32);
+
+        if (!(*word & bit)) {
+            *word |= bit;
+            v9fs->fid_hint = (fid + 1) % V9FS_MAX_FIDS;
+            mutex_release(&v9fs->lock);
+            return fid;
+        }
+    }
+
     mutex_release(&v9fs->lock);
-    return fid;
+    return V9FS_NO_FID;
+}
+
+void free_fid(v9fs_t *v9fs, uint32_t fid) {
+    if (fid == V9FS_NO_FID) {
+        return;
+    }
+
+    DEBUG_ASSERT(fid < V9FS_MAX_FIDS);
+
+    mutex_acquire(&v9fs->lock);
+    DEBUG_ASSERT(v9fs->fid_map[fid / 32] & (1u << (fid % 32)));
+    v9fs->fid_map[fid / 32] &= ~(1u << (fid % 32));
+    mutex_release(&v9fs->lock);
 }
 
 void put_fid(v9fs_t *v9fs, uint32_t fid) {
+    if (fid == V9FS_NO_FID) {
+        return;
+    }
+
     virtio_9p_msg_t tclunk = {
         .msg_type = P9_TCLUNK,
         .tag = P9_TAG_DEFAULT,
@@ -81,10 +113,19 @@ void put_fid(v9fs_t *v9fs, uint32_t fid) {
         }};
     virtio_9p_msg_t rclunk = {};
 
-    ASSERT(virtio_9p_rpc(v9fs->dev, &tclunk, &rclunk) == NO_ERROR);
-    ASSERT(rclunk.msg_type == P9_RCLUNK);
+    // a clunk that fails leaves the fid stranded on the server, which is worth
+    // knowing about but is not worth taking the system down for: the number is
+    // reusable from our side either way, and the caller is usually tearing
+    // something down and has nothing better to do with the failure
+    status_t err = virtio_9p_rpc(v9fs->dev, &tclunk, &rclunk);
+    if (err != NO_ERROR || rclunk.msg_type != P9_RCLUNK) {
+        TRACEF("clunk of fid %u failed: %d, reply type %u\n", fid, err,
+               rclunk.msg_type);
+    }
 
     virtio_9p_msg_destroy(&rclunk);
+
+    free_fid(v9fs, fid);
 }
 
 status_t v9fs_mount(bdev_t *dev, fscookie **cookie, enum fs_mount_options options) {
@@ -108,11 +149,16 @@ status_t v9fs_mount(bdev_t *dev, fscookie **cookie, enum fs_mount_options option
     // initialize v9fs structure
     v9fs->dev = virtio_9p_bdev_to_virtio_device(dev);
     v9fs->bdev = dev;
-    v9fs->unused_fid = 0;
     list_initialize(&v9fs->files);
     list_initialize(&v9fs->dirs);
     mutex_init(&v9fs->lock);
     v9fs->root.fid = get_unused_fid(v9fs);
+    if (v9fs->root.fid == V9FS_NO_FID) {
+        // unreachable on a fresh allocator, but the attach below would
+        // otherwise be sent with P9_FID_NOFID as its fid
+        ret = ERR_NO_RESOURCES;
+        goto err;
+    }
 
     LTRACEF("v9fs->root.fid: %u\n", v9fs->root.fid);
     // attach to the host

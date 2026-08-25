@@ -52,6 +52,10 @@ status_t v9fs_open_dir(fscookie *cookie, const char *path, dircookie **dcookie) 
     }
 
     dir->fid.fid = get_unused_fid(v9fs);
+    if (dir->fid.fid == V9FS_NO_FID) {
+        ret = ERR_NO_RESOURCES;
+        goto err;
+    }
 
     virtio_9p_msg_t twalk = {
         .msg_type = P9_TWALK,
@@ -72,13 +76,15 @@ status_t v9fs_open_dir(fscookie *cookie, const char *path, dircookie **dcookie) 
     }
 
     if ((ret = virtio_9p_rpc(v9fs->dev, &twalk, &rwalk)) != NO_ERROR) {
-        goto err;
+        goto free_the_fid;
     }
 
     if (rwalk.msg_type != P9_RWALK ||
         rwalk.msg.rwalk.nwqid != twalk.msg.twalk.nwname) {
+        // the walk did not complete, so the server never took the new fid
         ret = ERR_NOT_FOUND;
-        goto err;
+        virtio_9p_msg_destroy(&rwalk);
+        goto free_the_fid;
     }
 
     // assume all dir are opened as readonly directory
@@ -124,7 +130,12 @@ status_t v9fs_open_dir(fscookie *cookie, const char *path, dircookie **dcookie) 
 
 des_rwalk:
     virtio_9p_msg_destroy(&rwalk);
+    // the walk succeeded, so the fid exists on the server
     put_fid(v9fs, dir->fid.fid);
+    goto err;
+
+free_the_fid:
+    free_fid(v9fs, dir->fid.fid);
 
 err:
     free(dir);
@@ -144,6 +155,9 @@ status_t v9fs_mkdir(fscookie *cookie, const char *path) {
     strlcpy(temppath, path, sizeof(temppath));
 
     dfid = get_unused_fid(v9fs);
+    if (dfid == V9FS_NO_FID) {
+        return ERR_NO_RESOURCES;
+    }
 
     virtio_9p_msg_t twalk = {
         .msg_type = P9_TWALK,
@@ -172,13 +186,16 @@ status_t v9fs_mkdir(fscookie *cookie, const char *path) {
 
     // walk to the parent directory
     if ((ret = virtio_9p_rpc(v9fs->dev, &twalk, &rwalk)) != NO_ERROR) {
-        goto err;
+        free_fid(v9fs, dfid);
+        return ret;
     }
 
     if (rwalk.msg_type != P9_RWALK ||
         rwalk.msg.rwalk.nwqid != twalk.msg.twalk.nwname) {
-        ret = ERR_NOT_DIR;
-        goto err;
+        // the walk did not complete, so the server never took the new fid
+        virtio_9p_msg_destroy(&rwalk);
+        free_fid(v9fs, dfid);
+        return ERR_NOT_DIR;
     }
 
     // assume the dir is created as 040755
@@ -208,8 +225,6 @@ status_t v9fs_mkdir(fscookie *cookie, const char *path) {
 
 des_rwalk:
     virtio_9p_msg_destroy(&rwalk);
-
-err:
     put_fid(v9fs, dfid);
     return ret;
 }

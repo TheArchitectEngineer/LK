@@ -59,6 +59,10 @@ status_t v9fs_open_file(fscookie *cookie, const char *path,
     mutex_init(&file->lock);
 
     file->fid.fid = get_unused_fid(v9fs);
+    if (file->fid.fid == V9FS_NO_FID) {
+        ret = ERR_NO_RESOURCES;
+        goto err;
+    }
 
     virtio_9p_msg_t twalk = {
         .msg_type = P9_TWALK,
@@ -70,13 +74,15 @@ status_t v9fs_open_file(fscookie *cookie, const char *path,
     path_to_wname(temppath, &twalk.msg.twalk.nwname, twalk.msg.twalk.wname);
 
     if ((ret = virtio_9p_rpc(v9fs->dev, &twalk, &rwalk)) != NO_ERROR) {
-        goto err;
+        goto free_fid;
     }
 
     if (rwalk.msg_type != P9_RWALK ||
         rwalk.msg.rwalk.nwqid != twalk.msg.twalk.nwname) {
+        // the walk did not complete, so the server never took the new fid
         ret = ERR_NOT_FOUND;
-        goto err;
+        virtio_9p_msg_destroy(&rwalk);
+        goto free_fid;
     }
 
     // assume all file are opened as "w+"
@@ -92,7 +98,10 @@ status_t v9fs_open_file(fscookie *cookie, const char *path,
     virtio_9p_msg_t rlopen = {};
 
     if ((ret = virtio_9p_rpc(v9fs->dev, &tlopen, &rlopen)) != NO_ERROR) {
-        goto des_rwalk;
+        virtio_9p_msg_destroy(&rwalk);
+        // the walk succeeded, so the fid exists on the server
+        put_fid(v9fs, file->fid.fid);
+        goto err;
     }
 
     file->v9fs = v9fs;
@@ -107,8 +116,8 @@ status_t v9fs_open_file(fscookie *cookie, const char *path,
 
     return NO_ERROR;
 
-des_rwalk:
-    virtio_9p_msg_destroy(&rwalk);
+free_fid:
+    free_fid(v9fs, file->fid.fid);
 
 err:
     LTRACEF("open file (%s) failed: %d\n", path, ret);
@@ -144,6 +153,10 @@ status_t v9fs_create_file(fscookie *cookie, const char *path,
     mutex_init(&file->lock);
 
     file->fid.fid = get_unused_fid(v9fs);
+    if (file->fid.fid == V9FS_NO_FID) {
+        ret = ERR_NO_RESOURCES;
+        goto err;
+    }
 
     virtio_9p_msg_t twalk = {
         .msg_type = P9_TWALK,
@@ -170,13 +183,15 @@ status_t v9fs_create_file(fscookie *cookie, const char *path,
 
     // walk to the parent directory
     if ((ret = virtio_9p_rpc(v9fs->dev, &twalk, &rwalk)) != NO_ERROR) {
-        goto err;
+        goto free_fid;
     }
 
     if (rwalk.msg_type != P9_RWALK ||
         rwalk.msg.rwalk.nwqid != twalk.msg.twalk.nwname) {
+        // the walk did not complete, so the server never took the new fid
         ret = ERR_NOT_DIR;
-        goto err;
+        virtio_9p_msg_destroy(&rwalk);
+        goto free_fid;
     }
 
     // assume the file is created as 0666
@@ -198,7 +213,10 @@ status_t v9fs_create_file(fscookie *cookie, const char *path,
     virtio_9p_msg_t rlcreate = {};
 
     if ((ret = virtio_9p_rpc(v9fs->dev, &tlcreate, &rlcreate)) != NO_ERROR) {
-        goto des_rwalk;
+        virtio_9p_msg_destroy(&rwalk);
+        // the walk succeeded, so the fid exists on the server
+        put_fid(v9fs, file->fid.fid);
+        goto err;
     }
 
     file->v9fs = v9fs;
@@ -213,8 +231,8 @@ status_t v9fs_create_file(fscookie *cookie, const char *path,
 
     return NO_ERROR;
 
-des_rwalk:
-    virtio_9p_msg_destroy(&rwalk);
+free_fid:
+    free_fid(v9fs, file->fid.fid);
 
 err:
     LTRACEF("create file (%s) failed: %d\n", path, ret);

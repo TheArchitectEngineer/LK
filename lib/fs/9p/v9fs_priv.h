@@ -32,13 +32,22 @@ typedef struct v9fs_fid {
     virtio_9p_qid_t qid;
 } v9fs_fid_t;
 
+// Fids are a server side resource, so they are recycled rather than handed out
+// from an ever-increasing counter. One bit per fid, and fid 0 is usable: the
+// protocol reserves only P9_FID_NOFID.
+#define V9FS_MAX_FIDS 512
+#define V9FS_FID_WORDS (V9FS_MAX_FIDS / 32)
+#define V9FS_NO_FID    P9_FID_NOFID
+
 typedef struct v9fs {
     struct virtio_device *dev;
     bdev_t *bdev;
 
-    uint32_t unused_fid;
     v9fs_fid_t root;
-    mutex_t lock;
+    mutex_t lock;                        // guards the fid allocator
+
+    uint32_t fid_map[V9FS_FID_WORDS];    // 1 = in use
+    uint32_t fid_hint;                   // where the next search starts
 
     struct list_node files;
     struct list_node dirs;
@@ -93,5 +102,10 @@ status_t v9fs_read_dir(dircookie *dcookie, struct dirent *ent);
 status_t v9fs_close_dir(dircookie *dcookie);
 
 status_t path_to_wname(char *path, uint16_t *nwname, const char *wname[P9_MAXWELEM]) __NONNULL((1)) __NONNULL((2));
+
+/* Reserve an unused fid number, or V9FS_NO_FID if the mount is out of them. */
 uint32_t get_unused_fid(v9fs_t *v9fs);
+/* Return a fid number the server has already clunked (or never allocated). */
+void free_fid(v9fs_t *v9fs, uint32_t fid);
+/* Clunk a fid on the server and return its number to the allocator. */
 void put_fid(v9fs_t *v9fs, uint32_t fid);
