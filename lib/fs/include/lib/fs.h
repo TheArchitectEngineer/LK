@@ -77,12 +77,8 @@ status_t fs_stat_fs(const char *mountpoint, struct fs_stat *stat) __NONNULL((1))
 /* walk through a path string, removing duplicate path separators, flattening . and .. references */
 void fs_normalize_path(char *path) __NONNULL();
 
-/* Remove any leading spaces or slashes */
-const char *trim_name(const char *_name);
-
 /* file system api */
 typedef struct fscookie fscookie;
-typedef struct filecookie filecookie;
 typedef struct dircookie dircookie;
 struct bdev;
 
@@ -122,6 +118,14 @@ status_t fs_vnode_create(uint64_t id, enum fs_vnode_type type, void *priv,
  * inside a filesystem op). Invalid on a vnode the layer has seen. */
 void fs_vnode_destroy(struct fs_vnode *vn) __NONNULL();
 
+/* The operations a filesystem provides. Most are optional: a NULL member makes
+ * the corresponding call return ERR_NOT_SUPPORTED, so the minimum viable
+ * filesystem is a read-only flat one with mount/unmount/lookup/read.
+ *
+ * Required: mount, unmount, lookup, read, and -- if opendir is provided --
+ * readdir and closedir, which are called without a NULL check once a directory
+ * handle exists. Everything else may be NULL.
+ */
 struct fs_api {
     // volume ops
     status_t (*format)(struct bdev *, const void *args);
@@ -159,44 +163,14 @@ struct fs_api {
     status_t (*closedir)(dircookie *);
 };
 
-/* The legacy string-path interface: each filesystem resolves whole paths
- * itself. Being replaced by the vnode api above, one filesystem at a time. */
-struct fs_legacy_api {
-    status_t (*format)(struct bdev *, const void *);
-    status_t (*fs_stat)(fscookie *, struct fs_stat *);
-
-    status_t (*mount)(struct bdev *, fscookie **, enum fs_mount_options options);
-    status_t (*unmount)(fscookie *);
-    status_t (*open)(fscookie *, const char *, filecookie **);
-    status_t (*create)(fscookie *, const char *, filecookie **, uint64_t);
-    status_t (*remove)(fscookie *, const char *);
-    status_t (*rmdir)(fscookie *, const char *);
-    status_t (*truncate)(filecookie *, uint64_t);
-    status_t (*stat)(filecookie *, struct file_stat *);
-    ssize_t (*read)(filecookie *, void *, off_t, size_t);
-    ssize_t (*write)(filecookie *, const void *, off_t, size_t);
-    status_t (*close)(filecookie *);
-
-    status_t (*mkdir)(fscookie *, const char *);
-    status_t (*opendir)(fscookie *, const char *, dircookie **) __NONNULL();
-    status_t (*readdir)(dircookie *, struct dirent *) __NONNULL();
-    status_t (*closedir)(dircookie *) __NONNULL();
-
-    status_t (*file_ioctl)(filecookie *, int, void *);
-};
-
 struct fs_impl {
     const char *name;
-    const struct fs_api *api;               // vnode interface
-    const struct fs_legacy_api *legacy_api; // string-path interface
+    const struct fs_api *api;
 };
 
 /* define in your fs implementation to register your api with the fs layer */
 #define STATIC_FS_IMPL(_name, _api) const struct fs_impl __fs_impl_##_name __ALIGNED(sizeof(void *)) __SECTION("fs_impl") = \
-                                        {.name = #_name, .api = _api, .legacy_api = NULL}
-
-#define STATIC_FS_IMPL_LEGACY(_name, _api) const struct fs_impl __fs_impl_##_name __ALIGNED(sizeof(void *)) __SECTION("fs_impl") = \
-                                        {.name = #_name, .api = NULL, .legacy_api = _api}
+                                        {.name = #_name, .api = _api}
 
 /* Resize the layer's node cache at runtime (primarily a test and bringup
  * knob; the compile-time default comes from the FS_NODE_CACHE_SIZE build
