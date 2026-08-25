@@ -1,11 +1,13 @@
 # lib/fs: moving the path walk into the fs layer
 
-Status: in progress, 2026-08-24. Phases 0-5 are implemented on this branch:
+Status: in progress, 2026-08-24. Phases 0-6 are implemented on this branch:
 the pre-fixes and test expansion of §6 Phase 0, the node tree / vnode
 interface / walk of Phase 1, the memfs conversion plus the
 FS_NODE_CACHE_SIZE LRU of Phase 2, the ext2 conversion of Phase 3, the
-spifs conversion of Phase 4 and the FAT conversion of Phase 5. Sections below
-describe the design as proposed; deviations that emerged during
+spifs conversion of Phase 4, the FAT conversion of Phase 5 and the 9p
+conversion of Phase 6. Every filesystem in the tree is now on the vnode
+interface, so nothing registers through fs_legacy_api any more. Sections
+below describe the design as proposed; deviations that emerged during
 implementation:
 
 - the dirhandle holds the directory's *vnode* (plus the fs cursor), not the
@@ -61,7 +63,47 @@ implementation:
   unreachable code; FAT is the natural first implementation when the public
   call arrives
 
-Phases 6 (9p) and 7 (cleanup) remain.
+- 9p keeps **two fids per vnode**, not one. 9P2000 says a walk may not start
+  from a fid that has been opened for I/O, so the fid an object was walked to
+  is never opened and the I/O fid is cloned off it on first use. qemu turns
+  out to permit the walk anyway -- a probe against it answers Rwalk, not
+  Rlerror -- so this is conformance with the protocol rather than a
+  workaround for the one server LK talks to, and it costs one clone and one
+  clunk per object that is actually read or enumerated
+- Tremove clunks the fid it is handed whether or not the removal succeeds, so
+  9p removes through a *clone* of the child's walk fid. Using the child's own
+  fid would work only when the removal succeeds; a refused rmdir of a
+  non-empty directory would leave the surviving vnode holding a fid the
+  server had already dropped, and everything through that directory would
+  fail until the node cache aged it out
+- 9p's per-handle 4KB write-back page buffer is deleted rather than moved
+  onto the vnode. Shared per object it would have to be flushed from
+  release(), which the layer defers behind its node cache, so a write could
+  sit unsent indefinitely -- and a reopen would read it back through the
+  buffer without the server ever seeing it. Writes are write-through now;
+  bulk transfers are chunked at PAGE_SIZE either way, so only repeated
+  sub-4KB access to one page pays for it
+- 9p reports a host symlink as a plain file. The layer would follow a
+  FS_VNODE_SYMLINK through readlink(), and the transport implements neither
+  Treadlink nor Tsymlink, so claiming the type would break the walk
+- **walk RPC amplification, measured against qemu**: a cold five component
+  open costs six Twalks (one per component plus the I/O clone) where the old
+  whole-path Twalk cost one; a warm one costs zero, because the node cache
+  answers the path and the vnode still holds its opened fid. The optional
+  multi-component lookup §6 leaves open is not worth an fs_api change that
+  touches every filesystem for a cost only the first open pays
+- 9p's fids come from a bitmap over a fixed range (512) rather than a
+  counter, so they are recycled; a mount that exhausts them fails the lookup
+  with ERR_NO_RESOURCES rather than reusing a live one
+- qid.path is assumed unique across the share, which is what dedup keys on.
+  It is not, for a share that spans devices (qemu's multidevs=), where two
+  files on different devices would collapse into one vnode
+- §5 costed the 9p conversion at +150 bytes; it measures −448 (5,255 → 4,807
+  text, arm64 DEBUG=0), and a vnode is ~24 bytes of heap where an open file
+  used to cost more than 4KB. The core is untouched by this phase: fs.c is
+  byte-identical, so the §1 budget stands where Phase 3 left it
+
+Phase 7 (cleanup) remains.
 
 ## 1. Problem and constraints
 

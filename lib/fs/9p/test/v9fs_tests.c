@@ -22,6 +22,11 @@
 //
 // The suite cleans up after itself, and removes anything a previous run left
 // behind before it starts, so it can be run repeatedly against one share.
+//
+// The do-qemu* scripts export the share with security_model=mapped, which
+// keeps each file's mode in a user.virtfs.* extended attribute. Point -f at a
+// filesystem that has no xattrs (an NFS mount, say) and every create fails
+// with an I/O error that looks like a driver bug and is not one.
 
 #define V9FS_MOUNT_POINT "/v9p"
 #define V9FS_NAME        "9p"
