@@ -20,9 +20,8 @@
 // so it is safe in every ut all run; set test.v9fs.required=1 on the kernel
 // command line to turn a missing device into a hard failure.
 //
-// The driver has no remove/rmdir yet, so the suite cannot clean up after
-// itself: it leaves lk_v9fs_test_file and lk_v9fs_test_dir/ in the share, and
-// is written to pass again when they already exist.
+// The suite cleans up after itself, and removes anything a previous run left
+// behind before it starts, so it can be run repeatedly against one share.
 
 #define V9FS_MOUNT_POINT "/v9p"
 #define V9FS_NAME        "9p"
@@ -94,14 +93,15 @@ static uint8_t pattern_byte(uint32_t seed, uint64_t offset) {
     return (uint8_t)x;
 }
 
-// A previous run may have left the file behind, and the driver has no remove,
-// so treat create and open-existing the same.
-static status_t create_or_open(const char *path, filehandle **h) {
-    status_t err = fs_create_file(path, h, 0);
-    if (err < 0) {
-        err = fs_open_file(path, h);
-    }
-    return err;
+// The suite removes everything it creates, so a run leaves the share as it
+// found it. A previous run that died partway can still have left something
+// behind, though, so anything about to be created is removed first.
+static void remove_if_present(const char *path) {
+    fs_remove_file(path);
+}
+
+static void remove_dir_if_present(const char *path) {
+    fs_remove_dir(path);
 }
 
 static bool test_v9fs_mount(void) {
@@ -123,11 +123,16 @@ static bool test_v9fs_file_io(void) {
     SKIP_TEST_IF_NO_DEVICE();
 
     ASSERT_TRUE(mount_v9fs(), "mount");
+    remove_if_present(TEST_FILE);
 
     // creating at the top of the mount exercises the root-level create path
     // (which used to send "/name", slash included, to the server)
     filehandle *h;
-    ASSERT_EQ(NO_ERROR, create_or_open(TEST_FILE, &h), "create");
+    ASSERT_EQ(NO_ERROR, fs_create_file(TEST_FILE, &h, 0), "create");
+
+    // creating over an existing name is refused rather than truncating it
+    filehandle *h2;
+    EXPECT_EQ(ERR_ALREADY_EXISTS, fs_create_file(TEST_FILE, &h2, 0), "create twice");
 
     enum { kLen = 4096 };
     uint8_t *buf = malloc(kLen);
@@ -141,13 +146,13 @@ static bool test_v9fs_file_io(void) {
     // stat goes to the server; a failure here used to leave the file mutex held
     struct file_stat st;
     EXPECT_EQ(NO_ERROR, fs_stat_file(h, &st), "stat");
-    EXPECT_LE((uint64_t)kLen, st.size, "stat size");
+    EXPECT_EQ((uint64_t)kLen, st.size, "stat size");
     EXPECT_FALSE(st.is_dir, "not a dir");
 
     EXPECT_EQ(NO_ERROR, fs_close_file(h), "close");
 
-    // read it back through a fresh handle so nothing is served from the
-    // handle's page buffer
+    // read it back through a fresh handle. writes are write-through, so this
+    // reaches the host's copy rather than anything cached on this side
     ASSERT_EQ(NO_ERROR, fs_open_file(TEST_FILE, &h), "reopen");
     memset(buf, 0, kLen);
     EXPECT_EQ((ssize_t)kLen, fs_read_file(h, buf, 0, kLen), "read");
@@ -160,12 +165,23 @@ static bool test_v9fs_file_io(void) {
         }
     }
     EXPECT_TRUE(match, "content");
+
+    // an unaligned range running off the end of the file reads what is there
+    // and stops; past the end it reads nothing
+    memset(buf, 0, kLen);
+    EXPECT_EQ((ssize_t)96, fs_read_file(h, buf, 4000, 100), "tail read");
+    EXPECT_EQ(pattern_byte(0x9999, 4000), buf[0], "tail content");
+    EXPECT_EQ((ssize_t)0, fs_read_file(h, buf, kLen, 16), "read past the end");
+
     EXPECT_EQ(NO_ERROR, fs_close_file(h), "close reopened");
 
     free(buf);
 
     EXPECT_EQ(ERR_NOT_FOUND, fs_open_file(V9FS_MOUNT_POINT "/lk_v9fs_no_such_file", &h),
               "missing file");
+
+    EXPECT_EQ(NO_ERROR, fs_remove_file(TEST_FILE), "remove");
+    EXPECT_EQ(ERR_NOT_FOUND, fs_open_file(TEST_FILE, &h), "removed file is gone");
 
     EXPECT_EQ(NO_ERROR, fs_unmount(V9FS_MOUNT_POINT), "unmount");
 
@@ -177,37 +193,164 @@ static bool test_v9fs_dirs(void) {
     SKIP_TEST_IF_NO_DEVICE();
 
     ASSERT_TRUE(mount_v9fs(), "mount");
+    remove_if_present(TEST_DIR "/nested");
+    remove_dir_if_present(TEST_DIR);
 
-    // root-level mkdir exercises the same leading-slash path as create.
-    // the server refuses a mkdir of an existing directory, which the driver
-    // currently surfaces as ERR_NOT_ALLOWED; what matters is the directory
-    // exists and works afterwards.
-    status_t err = fs_make_dir(TEST_DIR);
-    EXPECT_TRUE(err == NO_ERROR || err == ERR_NOT_ALLOWED, "mkdir");
+    // root-level mkdir exercises the same leading-slash path as create
+    ASSERT_EQ(NO_ERROR, fs_make_dir(TEST_DIR), "mkdir");
+    EXPECT_EQ(ERR_ALREADY_EXISTS, fs_make_dir(TEST_DIR), "mkdir twice");
 
     filehandle *h;
-    ASSERT_EQ(NO_ERROR, create_or_open(TEST_DIR "/nested", &h), "nested create");
+    ASSERT_EQ(NO_ERROR, fs_create_file(TEST_DIR "/nested", &h, 0), "nested create");
     EXPECT_EQ(NO_ERROR, fs_close_file(h), "nested close");
 
-    // enumerate the directory and expect to find the file
+    // enumerate the directory: the file is listed, "." and ".." are not, and
+    // the end of the listing is ERR_NOT_FOUND like every other filesystem
     dirhandle *dh;
     ASSERT_EQ(NO_ERROR, fs_open_dir(TEST_DIR, &dh), "opendir");
-    bool seen = false;
+    bool seen = false, saw_dot = false, saw_dotdot = false;
     struct dirent ent;
     status_t rerr;
     while ((rerr = fs_read_dir(dh, &ent)) == NO_ERROR) {
-        if (!strcmp(ent.name, "nested")) {
-            seen = true;
-        }
+        if (!strcmp(ent.name, "nested")) seen = true;
+        if (!strcmp(ent.name, ".")) saw_dot = true;
+        if (!strcmp(ent.name, "..")) saw_dotdot = true;
     }
-    // 9p reports end-of-directory as ERR_OUT_OF_RANGE today; the fs rework
-    // will unify EOF on ERR_NOT_FOUND, so accept both
-    EXPECT_TRUE(rerr == ERR_OUT_OF_RANGE || rerr == ERR_NOT_FOUND, "readdir eof");
+    EXPECT_EQ(ERR_NOT_FOUND, rerr, "readdir eof");
     EXPECT_TRUE(seen, "nested file enumerated");
+    EXPECT_FALSE(saw_dot, "no . entry");
+    EXPECT_FALSE(saw_dotdot, "no .. entry");
     EXPECT_EQ(NO_ERROR, fs_close_dir(dh), "closedir");
 
+    // "." and ".." are still resolvable as path components, because the layer
+    // flattens them before the filesystem ever sees them
+    ASSERT_EQ(NO_ERROR, fs_open_file(TEST_DIR "/./nested", &h), "open via .");
+    EXPECT_EQ(NO_ERROR, fs_close_file(h), "close via .");
+    ASSERT_EQ(NO_ERROR, fs_open_file(TEST_DIR "/../lk_v9fs_test_dir/nested", &h),
+              "open via ..");
+    EXPECT_EQ(NO_ERROR, fs_close_file(h), "close via ..");
+
     // a file is not openable as a directory
-    EXPECT_GT(0, fs_open_dir(TEST_DIR "/nested", &dh), "file as dir");
+    EXPECT_EQ(ERR_NOT_DIR, fs_open_dir(TEST_DIR "/nested", &dh), "file as dir");
+
+    // and the two removal ops do not cross over
+    EXPECT_EQ(ERR_NOT_FILE, fs_remove_file(TEST_DIR), "remove_file on a dir");
+    EXPECT_EQ(ERR_NOT_DIR, fs_remove_dir(TEST_DIR "/nested"), "remove_dir on a file");
+
+    EXPECT_EQ(NO_ERROR, fs_remove_file(TEST_DIR "/nested"), "remove nested");
+    EXPECT_EQ(NO_ERROR, fs_remove_dir(TEST_DIR), "rmdir");
+
+    EXPECT_EQ(NO_ERROR, fs_unmount(V9FS_MOUNT_POINT), "unmount");
+
+    END_TEST;
+}
+
+// A directory is walked through and enumerated with two different fids,
+// because 9P2000 says a walk may not start from a fid that has been opened
+// for I/O. This is the ordering that would exercise the rule -- though not
+// against qemu, which permits the walk out of an opened fid regardless, so
+// collapsing the two fids would not fail here. It would on a server that
+// enforces the rule.
+static bool test_v9fs_walk_after_opendir(void) {
+    BEGIN_TEST;
+    SKIP_TEST_IF_NO_DEVICE();
+
+    ASSERT_TRUE(mount_v9fs(), "mount");
+    remove_if_present(TEST_DIR "/nested");
+    remove_dir_if_present(TEST_DIR);
+
+    ASSERT_EQ(NO_ERROR, fs_make_dir(TEST_DIR), "mkdir");
+    filehandle *h;
+    ASSERT_EQ(NO_ERROR, fs_create_file(TEST_DIR "/nested", &h, 0), "create");
+    EXPECT_EQ(NO_ERROR, fs_close_file(h), "close");
+
+    // enumerate first, which is what opens the directory
+    dirhandle *dh;
+    ASSERT_EQ(NO_ERROR, fs_open_dir(TEST_DIR, &dh), "opendir");
+    struct dirent ent;
+    EXPECT_EQ(NO_ERROR, fs_read_dir(dh, &ent), "readdir");
+
+    // then walk through it while it is still open
+    EXPECT_EQ(NO_ERROR, fs_open_file(TEST_DIR "/nested", &h), "open through open dir");
+    EXPECT_EQ(NO_ERROR, fs_close_file(h), "close");
+
+    EXPECT_EQ(NO_ERROR, fs_close_dir(dh), "closedir");
+
+    // and again after it has been closed, since the vnode keeps the opened fid
+    EXPECT_EQ(NO_ERROR, fs_open_file(TEST_DIR "/nested", &h), "open after closedir");
+    EXPECT_EQ(NO_ERROR, fs_close_file(h), "close");
+
+    EXPECT_EQ(NO_ERROR, fs_remove_file(TEST_DIR "/nested"), "remove nested");
+    EXPECT_EQ(NO_ERROR, fs_remove_dir(TEST_DIR), "rmdir");
+    EXPECT_EQ(NO_ERROR, fs_unmount(V9FS_MOUNT_POINT), "unmount");
+
+    END_TEST;
+}
+
+// Two handles on one name resolve to one vnode, which is what makes the
+// layer's busy check work and what keeps the two handles from disagreeing
+// about the file's contents.
+static bool test_v9fs_shared_vnode(void) {
+    BEGIN_TEST;
+    SKIP_TEST_IF_NO_DEVICE();
+
+    ASSERT_TRUE(mount_v9fs(), "mount");
+    remove_if_present(TEST_FILE);
+
+    filehandle *h1, *h2;
+    ASSERT_EQ(NO_ERROR, fs_create_file(TEST_FILE, &h1, 0), "create");
+    ASSERT_EQ(NO_ERROR, fs_open_file(TEST_FILE, &h2), "open second");
+
+    const char *msg = "shared";
+    EXPECT_EQ((ssize_t)6, fs_write_file(h1, msg, 0, 6), "write via first");
+
+    char buf[8] = {0};
+    EXPECT_EQ((ssize_t)6, fs_read_file(h2, buf, 0, 6), "read via second");
+    EXPECT_EQ(0, memcmp(buf, msg, 6), "content via second");
+
+    // the layer refuses to remove anything with a handle open on it
+    EXPECT_EQ(ERR_BUSY, fs_remove_file(TEST_FILE), "remove while open");
+    EXPECT_EQ(NO_ERROR, fs_close_file(h1), "close first");
+    EXPECT_EQ(ERR_BUSY, fs_remove_file(TEST_FILE), "remove with one still open");
+    EXPECT_EQ(NO_ERROR, fs_close_file(h2), "close second");
+    EXPECT_EQ(NO_ERROR, fs_remove_file(TEST_FILE), "remove after close");
+
+    EXPECT_EQ(NO_ERROR, fs_unmount(V9FS_MOUNT_POINT), "unmount");
+
+    END_TEST;
+}
+
+// A refused removal has to leave the directory usable. Tremove clunks the fid
+// it is handed even when the removal fails, so it is handed a clone rather
+// than the vnode's own.
+static bool test_v9fs_rmdir_not_empty(void) {
+    BEGIN_TEST;
+    SKIP_TEST_IF_NO_DEVICE();
+
+    ASSERT_TRUE(mount_v9fs(), "mount");
+    remove_if_present(TEST_DIR "/nested");
+    remove_dir_if_present(TEST_DIR);
+
+    ASSERT_EQ(NO_ERROR, fs_make_dir(TEST_DIR), "mkdir");
+    filehandle *h;
+    ASSERT_EQ(NO_ERROR, fs_create_file(TEST_DIR "/nested", &h, 0), "create");
+    EXPECT_EQ(NO_ERROR, fs_close_file(h), "close");
+
+    EXPECT_EQ(ERR_NOT_ALLOWED, fs_remove_dir(TEST_DIR), "rmdir non-empty");
+
+    // the directory survived the refusal: it can still be walked through,
+    // enumerated, and finally removed
+    EXPECT_EQ(NO_ERROR, fs_open_file(TEST_DIR "/nested", &h), "open after refusal");
+    EXPECT_EQ(NO_ERROR, fs_close_file(h), "close");
+
+    dirhandle *dh;
+    EXPECT_EQ(NO_ERROR, fs_open_dir(TEST_DIR, &dh), "opendir after refusal");
+    struct dirent ent;
+    EXPECT_EQ(NO_ERROR, fs_read_dir(dh, &ent), "readdir after refusal");
+    EXPECT_EQ(NO_ERROR, fs_close_dir(dh), "closedir");
+
+    EXPECT_EQ(NO_ERROR, fs_remove_file(TEST_DIR "/nested"), "remove nested");
+    EXPECT_EQ(NO_ERROR, fs_remove_dir(TEST_DIR), "rmdir");
 
     EXPECT_EQ(NO_ERROR, fs_unmount(V9FS_MOUNT_POINT), "unmount");
 
@@ -218,4 +361,7 @@ BEGIN_TEST_CASE(v9fs_tests)
 RUN_TEST(test_v9fs_mount)
 RUN_TEST(test_v9fs_file_io)
 RUN_TEST(test_v9fs_dirs)
+RUN_TEST(test_v9fs_walk_after_opendir)
+RUN_TEST(test_v9fs_shared_vnode)
+RUN_TEST(test_v9fs_rmdir_not_empty)
 END_TEST_CASE(v9fs_tests)
