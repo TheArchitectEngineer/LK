@@ -567,4 +567,4 @@ moved any text the table names, so a link order or relaxation surprise is loud.
    Also contains top level lk/ include headers.
 
 For longer documentation see `docs/index.md`, which indexes the threading/scheduler, blocking
-primitives, VMM, source tree layout, UEFI boot and QEMU networking guides.
+primitives, VMM, filesystem layer, source tree layout, UEFI boot and QEMU networking guides.

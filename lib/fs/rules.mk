@@ -10,8 +10,9 @@ MODULE_OPTIONS := test
 
 MODULE_DEPS += lib/bio
 
-# how many unreferenced name nodes the layer keeps cached; see fs.c for the
-# default (0 on LK_EMBEDDED targets, 64 otherwise)
+# How many unreferenced name nodes the layer keeps cached so a rewalk of a
+# recent path skips the filesystem lookups. Zero disables the cache entirely.
+# Defaults to 0 on LK_EMBEDDED targets and 64 otherwise; see docs/fs.md.
 ifneq ($(FS_NODE_CACHE_SIZE),)
 MODULE_DEFINES += FS_NODE_CACHE_SIZE=$(FS_NODE_CACHE_SIZE)
 endif
