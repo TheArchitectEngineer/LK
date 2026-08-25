@@ -176,7 +176,10 @@ bool exercise_volume(ram_volume &vol, const fat_test::geometry &g) {
     ASSERT_EQ(NO_ERROR, fs_close_file(fh));
     EXPECT_TRUE(write_and_verify(path, 0x4444, 0, 300));
 
-    // . and .. must both be present in a new directory
+    // A listing reports what the directory holds and nothing else. FAT records "."
+    // and ".." on disk as a subdirectory's own and its parent's starting cluster,
+    // but the fs layer flattens both lexically and no filesystem in the tree
+    // reports them, so they must not show up here either.
     dirhandle *dh = nullptr;
     ASSERT_EQ(NO_ERROR, fs_open_dir(dirpath, &dh));
     bool saw_dot = false, saw_dotdot = false, saw_nested = false;
@@ -190,9 +193,25 @@ bool exercise_volume(ram_volume &vol, const fat_test::geometry &g) {
         else if (!strnicmp(ent.name, "nested", sizeof("nested"))) saw_nested = true;
     }
     ASSERT_EQ(NO_ERROR, fs_close_dir(dh));
-    EXPECT_TRUE(saw_dot);
-    EXPECT_TRUE(saw_dotdot);
+    EXPECT_FALSE(saw_dot);
+    EXPECT_FALSE(saw_dotdot);
     EXPECT_TRUE(saw_nested);
+
+    // they are still reachable as paths, which the layer resolves without asking
+    // the filesystem about either name
+    char dotpath[FS_MAX_PATH_LEN];
+    snprintf(dotpath, sizeof(dotpath), "%s/subdir/./nested", vol.path());
+    fh = nullptr;
+    EXPECT_EQ(NO_ERROR, fs_open_file(dotpath, &fh));
+    if (fh) {
+        EXPECT_EQ(NO_ERROR, fs_close_file(fh));
+    }
+    snprintf(dotpath, sizeof(dotpath), "%s/subdir/../subdir/nested", vol.path());
+    fh = nullptr;
+    EXPECT_EQ(NO_ERROR, fs_open_file(dotpath, &fh));
+    if (fh) {
+        EXPECT_EQ(NO_ERROR, fs_close_file(fh));
+    }
 
     // everything written so far must survive a round trip through the device
     ASSERT_EQ(NO_ERROR, vol.remount());
@@ -422,6 +441,150 @@ bool test_fat_long_paths() {
     END_TEST;
 }
 
+// mkdir and remove below the root. The root is a special case at every width --
+// a fixed extent on FAT12/16, a cluster chain on FAT32 -- so a directory one
+// level down runs different code: the entries are allocated out of a data
+// cluster that can be grown, and the parent's ".." has to name a real cluster.
+bool test_fat_nested_dirs() {
+    BEGIN_TEST;
+
+    const fat_test::geometry geoms[] = {
+        {"nested-fat12", 12, 512, 1, 100},
+        {"nested-fat16", 16, 512, 1, 5000},
+        {"nested-fat32", 32, 512, 1, 65525},
+    };
+
+    uint ran = 0;
+    for (auto &g : geoms) {
+        ram_volume vol;
+        const auto args = fat_test::format_args_for(g);
+        status_t err = vol.create(kDeviceName, kMountPath, fat_test::volume_size_for(g), args);
+        if (err == ERR_NO_MEMORY) {
+            unittest_printf("\n        skipping %s: volume would not allocate ", g.name);
+            continue;
+        }
+        ASSERT_EQ(NO_ERROR, err);
+        ran++;
+
+        char a[FS_MAX_PATH_LEN], b[FS_MAX_PATH_LEN], c[FS_MAX_PATH_LEN];
+        snprintf(a, sizeof(a), "%s/a", vol.path());
+        snprintf(b, sizeof(b), "%s/a/b", vol.path());
+        snprintf(c, sizeof(c), "%s/a/b/c_with_a_long_name", vol.path());
+
+        ASSERT_EQ(NO_ERROR, fs_make_dir(a));
+        ASSERT_EQ(NO_ERROR, fs_make_dir(b));
+        ASSERT_EQ(NO_ERROR, fs_make_dir(c));
+
+        // making one that is already there, at depth, must not clobber it
+        EXPECT_EQ(ERR_ALREADY_EXISTS, fs_make_dir(b));
+
+        // a file in the deepest directory, written through the nested path
+        char file[FS_MAX_PATH_LEN];
+        snprintf(file, sizeof(file), "%s/deep.txt", c);
+        filehandle *fh = nullptr;
+        ASSERT_EQ(NO_ERROR, fs_create_file(file, &fh, 0));
+        ASSERT_EQ(NO_ERROR, fs_close_file(fh));
+        EXPECT_TRUE(write_and_verify(file, 0x6666, 0, 700));
+
+        // it all has to survive a trip through the device
+        ASSERT_EQ(NO_ERROR, vol.remount());
+        EXPECT_TRUE(verify_file_contents(file, 0x6666, 0, 700, 700));
+
+        // a directory with something in it cannot be removed, and neither can
+        // one whose only child is another directory
+        EXPECT_EQ(ERR_NOT_ALLOWED, fs_remove_dir(c));
+        EXPECT_EQ(ERR_NOT_ALLOWED, fs_remove_dir(b));
+        EXPECT_EQ(ERR_NOT_ALLOWED, fs_remove_dir(a));
+
+        // rmdir on a file and remove on a directory are both refused
+        EXPECT_EQ(ERR_NOT_DIR, fs_remove_dir(file));
+        EXPECT_EQ(ERR_NOT_FILE, fs_remove_file(c));
+
+        // now empty it out from the bottom
+        ASSERT_EQ(NO_ERROR, fs_remove_file(file));
+        fh = nullptr;
+        EXPECT_EQ(ERR_NOT_FOUND, fs_open_file(file, &fh));
+        ASSERT_EQ(NO_ERROR, fs_remove_dir(c));
+        ASSERT_EQ(NO_ERROR, fs_remove_dir(b));
+        ASSERT_EQ(NO_ERROR, fs_remove_dir(a));
+
+        // and the removals must have reached the disk too
+        ASSERT_EQ(NO_ERROR, vol.remount());
+        dirhandle *dh = nullptr;
+        EXPECT_EQ(ERR_NOT_FOUND, fs_open_dir(a, &dh));
+    }
+
+    EXPECT_GT(ran, 0u);
+
+    END_TEST;
+}
+
+// The first entry of a FAT12/16 root directory lives at cluster 0, offset 0.
+// That is a perfectly ordinary place for a file, but it is also the one location
+// that encodes to a vnode id of zero, which is the layer's value for "this object
+// has no identity to deduplicate on". Left that way, two opens of that one file
+// would get two vnodes: they would not share a length, and the layer's busy check
+// would see a single reference on each and let a remove through underneath them.
+bool test_fat_root_dir_first_entry() {
+    BEGIN_TEST;
+
+    const fat_test::geometry geoms[] = {
+        {"root-first-fat12", 12, 512, 1, 100},
+        {"root-first-fat16", 16, 512, 1, 5000},
+    };
+
+    uint ran = 0;
+    for (auto &g : geoms) {
+        ram_volume vol;
+        const auto args = fat_test::format_args_for(g);
+        status_t err = vol.create(kDeviceName, kMountPath, fat_test::volume_size_for(g), args);
+        if (err == ERR_NO_MEMORY) {
+            unittest_printf("\n        skipping %s: volume would not allocate ", g.name);
+            continue;
+        }
+        ASSERT_EQ(NO_ERROR, err);
+        ran++;
+
+        // a freshly formatted volume has an empty root directory (the volume
+        // label lives in the boot sector, not in an entry), so this is the file
+        // that lands in the very first slot
+        char path[FS_MAX_PATH_LEN];
+        snprintf(path, sizeof(path), "%s/first", vol.path());
+        filehandle *fh1 = nullptr;
+        ASSERT_EQ(NO_ERROR, fs_create_file(path, &fh1, 0));
+        ASSERT_EQ(NO_ERROR, fs_close_file(fh1));
+
+        fh1 = nullptr;
+        filehandle *fh2 = nullptr;
+        ASSERT_EQ(NO_ERROR, fs_open_file(path, &fh1));
+        ASSERT_EQ(NO_ERROR, fs_open_file(path, &fh2));
+
+        // both handles have to name one object, so a write through one is
+        // visible through the other, new length included
+        static const uint8_t data[] = {1, 2, 3, 4, 5, 6, 7, 8};
+        ASSERT_EQ((ssize_t)sizeof(data), fs_write_file(fh1, data, 0, sizeof(data)));
+
+        struct file_stat st = {};
+        ASSERT_EQ(NO_ERROR, fs_stat_file(fh2, &st));
+        EXPECT_EQ((uint64_t)sizeof(data), st.size);
+
+        uint8_t readback[sizeof(data)] = {};
+        EXPECT_EQ((ssize_t)sizeof(readback), fs_read_file(fh2, readback, 0, sizeof(readback)));
+        EXPECT_EQ(0, memcmp(data, readback, sizeof(data)));
+
+        // and it cannot be removed while either handle is open
+        EXPECT_EQ(ERR_BUSY, fs_remove_file(path));
+        ASSERT_EQ(NO_ERROR, fs_close_file(fh1));
+        EXPECT_EQ(ERR_BUSY, fs_remove_file(path));
+        ASSERT_EQ(NO_ERROR, fs_close_file(fh2));
+        EXPECT_EQ(NO_ERROR, fs_remove_file(path));
+    }
+
+    EXPECT_GT(ran, 0u);
+
+    END_TEST;
+}
+
 // Mounting a corrupt volume must fail cleanly. Before the device size check went
 // in, a BPB claiming more sectors than the device holds sent every subsequent
 // cluster computation off the end of it. These are cheap to construct on a RAM
@@ -527,6 +690,8 @@ BEGIN_TEST_CASE(fat_ram)
 RUN_TEST(test_fat_ram_geometries)
 RUN_TEST(test_fat_ram_format_roundtrip)
 RUN_TEST(test_fat_long_paths)
+RUN_TEST(test_fat_nested_dirs)
+RUN_TEST(test_fat_root_dir_first_entry)
 RUN_TEST(test_fat_format_rejects_impossible_geometry)
 RUN_TEST(test_fat_mount_rejects_malformed)
 END_TEST_CASE(fat_ram)

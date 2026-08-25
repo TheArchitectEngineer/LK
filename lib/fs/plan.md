@@ -1,11 +1,12 @@
 # lib/fs: moving the path walk into the fs layer
 
-Status: in progress, 2026-08-24. Phases 0-4 are implemented on this branch:
+Status: in progress, 2026-08-24. Phases 0-5 are implemented on this branch:
 the pre-fixes and test expansion of §6 Phase 0, the node tree / vnode
 interface / walk of Phase 1, the memfs conversion plus the
-FS_NODE_CACHE_SIZE LRU of Phase 2, the ext2 conversion of Phase 3 and the
-spifs conversion of Phase 4. Sections below describe the design as proposed;
-deviations that emerged during implementation:
+FS_NODE_CACHE_SIZE LRU of Phase 2, the ext2 conversion of Phase 3, the
+spifs conversion of Phase 4 and the FAT conversion of Phase 5. Sections below
+describe the design as proposed; deviations that emerged during
+implementation:
 
 - the dirhandle holds the directory's *vnode* (plus the fs cursor), not the
   fs_node; nothing pins node chains for open files or dirs, the vnode does
@@ -35,7 +36,32 @@ deviations that emerged during implementation:
   bcache I/O. That is what §4's locking decision buys; revisit only if a real
   target shows contention
 
-Phases 5 (FAT), 6 (9p) and 7 (cleanup) remain.
+- a vnode id of 0 means "no identity" to the layer, so a filesystem whose
+  natural identity can legitimately be zero has to shift it into a nonzero
+  encoding. FAT identifies an object by the location of its short name entry,
+  and 0:0 is the first entry of a FAT12/16 root directory, so it sets the high
+  bit of the id. Without that the file in that one slot gets a vnode per open,
+  which means no shared length and no working busy check
+- FAT's readdir no longer reports "." and "..", which brings it in line with
+  the listing contract above. They remain on disk, and remain resolvable as
+  path components, because the layer flattens both lexically
+- **§7 "vnode priv vs embedded" is resolved in favour of priv**: the layer
+  allocates the vnode, so embedding would mean handing allocation to the
+  filesystem for every object. FAT, the case the question was raised for, hangs
+  its per-object state off priv and frees it in release() exactly as ext2 does
+- **§5's "hash on dir_entry_location" for FAT is moot**: the layer's per-mount
+  vnode list *is* the open object table, and it deduplicates by id, so FAT's
+  own open file table and the linear lookup_file scan through it were deleted
+  rather than made faster
+- FAT unlink now matches a name the same way lookup does, through the
+  reconstructed long name. Removing a file by the short name alias FAT
+  generated for it no longer works, which is the same rule as opening it
+- no filesystem implements rename yet. The op exists in fs_api, but there is no
+  public fs_rename for anything to reach it through, so wiring one up would be
+  unreachable code; FAT is the natural first implementation when the public
+  call arrives
+
+Phases 6 (9p) and 7 (cleanup) remain.
 
 ## 1. Problem and constraints
 
