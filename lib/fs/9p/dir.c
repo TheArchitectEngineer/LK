@@ -105,10 +105,15 @@ static status_t remove_entry(struct fs_vnode *dir, struct fs_vnode *child) {
     virtio_9p_msg_t rremove = {};
 
     err = v9fs_rpc(v9fs, &tremove, &rremove, P9_RREMOVE);
+
+    const bool replied = v9fs_server_replied(&rremove);
     virtio_9p_msg_destroy(&rremove);
 
-    // the server has clunked it either way, so only the number comes back
-    free_fid(v9fs, fid);
+    if (replied) {
+        // a server that answered has clunked the fid whether or not it removed
+        // anything, so only the number comes back
+        free_fid(v9fs, fid);
+    }
 
     return err;
 }

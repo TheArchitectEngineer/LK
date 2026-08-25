@@ -150,18 +150,27 @@ void put_fid(v9fs_t *v9fs, uint32_t fid) {
         }};
     virtio_9p_msg_t rclunk = {};
 
-    // a clunk that fails leaves the fid stranded on the server, which is worth
-    // knowing about but is not worth taking the system down for: the number is
-    // reusable from our side either way, and the caller is usually tearing
-    // something down and has nothing better to do with the failure
+    // a clunk that the server refuses is worth knowing about but is not worth
+    // taking the system down for: the caller is usually tearing something down
+    // and has nothing better to do with the failure
     status_t err = v9fs_rpc(v9fs, &tclunk, &rclunk, P9_RCLUNK);
     if (err != NO_ERROR) {
         TRACEF("clunk of fid %u failed: %d\n", fid, err);
     }
 
+    const bool replied = v9fs_server_replied(&rclunk);
+
     virtio_9p_msg_destroy(&rclunk);
 
-    free_fid(v9fs, fid);
+    if (replied) {
+        // the server released the fid, whatever it thought of the request
+        free_fid(v9fs, fid);
+    } else {
+        // the request may or may not have reached the server, so the number
+        // has to be abandoned: handing it out again could collide with a fid
+        // that is still live over there
+        TRACEF("clunk of fid %u went unanswered, leaking the number\n", fid);
+    }
 }
 
 status_t v9fs_walk_fid(v9fs_t *v9fs, uint32_t fid, const char *name,
@@ -190,8 +199,13 @@ status_t v9fs_walk_fid(v9fs_t *v9fs, uint32_t fid, const char *name,
     }
 
     if (err != NO_ERROR) {
+        const bool replied = v9fs_server_replied(&rwalk);
         virtio_9p_msg_destroy(&rwalk);
-        free_fid(v9fs, newfid);
+        if (replied) {
+            // a walk the server answered and did not complete leaves the new
+            // fid untaken, so the number goes straight back
+            free_fid(v9fs, newfid);
+        }
         return err;
     }
 

@@ -99,6 +99,18 @@ void put_fid(v9fs_t *v9fs, uint32_t fid);
 status_t v9fs_rpc(v9fs_t *v9fs, const virtio_9p_msg_t *tmsg,
                   virtio_9p_msg_t *rmsg, uint32_t expect) __NONNULL();
 
+/* Did the server answer at all? A reply of any kind, Rlerror included, proves
+ * it processed the request and therefore did whatever the request says it does
+ * even on failure -- Tclunk and Tremove both release their fid that way. A
+ * transport level failure leaves that unknown, and the caller of a zero
+ * initialised rmsg can tell the two apart because no message type is zero.
+ *
+ * The distinction is what makes recycling fid numbers safe: a number may only
+ * go back into the allocator once the server is known to be done with it. */
+static inline bool v9fs_server_replied(const virtio_9p_msg_t *rmsg) {
+    return rmsg->msg_type != 0;
+}
+
 /* Walk one name from `fid` into a freshly allocated fid, or clone `fid` when
  * `name` is NULL. On failure nothing is left allocated on either side. */
 status_t v9fs_walk_fid(v9fs_t *v9fs, uint32_t fid, const char *name,

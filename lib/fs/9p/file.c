@@ -33,6 +33,15 @@
 
 #define LOCAL_TRACE 0
 
+// The server reports at open time the largest transfer it will handle in one
+// message on this fid; zero means it has no preference beyond the negotiated
+// msize, and PAGE_SIZE is what this driver asked for before it paid attention
+// to the field. Transfers are chunked either way, so a small value only costs
+// more round trips.
+static size_t io_chunk(const v9fs_vnode_t *v) {
+    return v->iounit ? v->iounit : PAGE_SIZE;
+}
+
 status_t v9fs_create(struct fs_vnode *dir, const char *name, uint64_t len,
                      struct fs_vnode **out) {
     v9fs_t *v9fs = v9fs_of(dir);
@@ -104,14 +113,16 @@ ssize_t v9fs_read(struct fs_vnode *vn, void *buf, off_t offset, size_t len) {
         return err;
     }
 
-    uint32_t fid = v9fs_vnode_of(vn)->io_fid;
+    const v9fs_vnode_t *v = v9fs_vnode_of(vn);
+    uint32_t fid = v->io_fid;
+    const size_t chunk = io_chunk(v);
 
     while (len > 0) {
         virtio_9p_msg_t tread = {
             .msg_type = P9_TREAD,
             .tag = P9_TAG_DEFAULT,
             .msg.tread = {
-                .fid = fid, .offset = offset, .count = MIN(len, PAGE_SIZE)}};
+                .fid = fid, .offset = offset, .count = MIN(len, chunk)}};
         virtio_9p_msg_t rread = {};
 
         err = v9fs_rpc(v9fs, &tread, &rread, P9_RREAD);
@@ -155,14 +166,16 @@ ssize_t v9fs_write(struct fs_vnode *vn, const void *buf, off_t offset,
         return err;
     }
 
-    uint32_t fid = v9fs_vnode_of(vn)->io_fid;
+    const v9fs_vnode_t *v = v9fs_vnode_of(vn);
+    uint32_t fid = v->io_fid;
+    const size_t chunk = io_chunk(v);
 
     while (len > 0) {
         virtio_9p_msg_t twrite = {
             .msg_type = P9_TWRITE,
             .tag = P9_TAG_DEFAULT,
             .msg.twrite = {
-                .fid = fid, .offset = offset, .count = MIN(len, PAGE_SIZE),
+                .fid = fid, .offset = offset, .count = MIN(len, chunk),
                 .data = cpos}};
         virtio_9p_msg_t rwrite = {};
 

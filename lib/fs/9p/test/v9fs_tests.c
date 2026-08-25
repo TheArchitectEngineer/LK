@@ -293,8 +293,8 @@ static bool test_v9fs_walk_after_opendir(void) {
 }
 
 // Two handles on one name resolve to one vnode, which is what makes the
-// layer's busy check work and what keeps the two handles from disagreeing
-// about the file's contents.
+// layer's busy check work: the ERR_BUSY below is only reachable if both
+// handles are counted against one object.
 static bool test_v9fs_shared_vnode(void) {
     BEGIN_TEST;
     SKIP_TEST_IF_NO_DEVICE();
@@ -320,6 +320,56 @@ static bool test_v9fs_shared_vnode(void) {
     EXPECT_EQ(NO_ERROR, fs_close_file(h2), "close second");
     EXPECT_EQ(NO_ERROR, fs_remove_file(TEST_FILE), "remove after close");
 
+    EXPECT_EQ(NO_ERROR, fs_unmount(V9FS_MOUNT_POINT), "unmount");
+
+    END_TEST;
+}
+
+// A transfer larger than a page, which is chunked at whatever the server said
+// it would accept in one message at open time (qemu answers ~124KB, so this is
+// one round trip rather than the sixteen a page-sized chunk would take).
+static bool test_v9fs_large_io(void) {
+    BEGIN_TEST;
+    SKIP_TEST_IF_NO_DEVICE();
+
+    ASSERT_TRUE(mount_v9fs(), "mount");
+    remove_if_present(TEST_FILE);
+
+    enum { kLen = 64 * 1024 };
+    uint8_t *buf = malloc(kLen);
+    ASSERT_NONNULL(buf, "buffer");
+
+    filehandle *h;
+    ASSERT_EQ(NO_ERROR, fs_create_file(TEST_FILE, &h, 0), "create");
+
+    for (size_t i = 0; i < kLen; i++) {
+        buf[i] = pattern_byte(0x5151, i);
+    }
+    EXPECT_EQ((ssize_t)kLen, fs_write_file(h, buf, 0, kLen), "write");
+    EXPECT_EQ(NO_ERROR, fs_close_file(h), "close");
+
+    ASSERT_EQ(NO_ERROR, fs_open_file(TEST_FILE, &h), "reopen");
+    memset(buf, 0, kLen);
+    EXPECT_EQ((ssize_t)kLen, fs_read_file(h, buf, 0, kLen), "read");
+
+    bool match = true;
+    for (size_t i = 0; i < kLen; i++) {
+        if (buf[i] != pattern_byte(0x5151, i)) {
+            unittest_printf("\n        content mismatch at offset %zu ", i);
+            match = false;
+            break;
+        }
+    }
+    EXPECT_TRUE(match, "content");
+
+    struct file_stat st;
+    EXPECT_EQ(NO_ERROR, fs_stat_file(h, &st), "stat");
+    EXPECT_EQ((uint64_t)kLen, st.size, "size");
+
+    EXPECT_EQ(NO_ERROR, fs_close_file(h), "close");
+    free(buf);
+
+    EXPECT_EQ(NO_ERROR, fs_remove_file(TEST_FILE), "remove");
     EXPECT_EQ(NO_ERROR, fs_unmount(V9FS_MOUNT_POINT), "unmount");
 
     END_TEST;
@@ -368,5 +418,6 @@ RUN_TEST(test_v9fs_file_io)
 RUN_TEST(test_v9fs_dirs)
 RUN_TEST(test_v9fs_walk_after_opendir)
 RUN_TEST(test_v9fs_shared_vnode)
+RUN_TEST(test_v9fs_large_io)
 RUN_TEST(test_v9fs_rmdir_not_empty)
 END_TEST_CASE(v9fs_tests)
