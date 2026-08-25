@@ -1,13 +1,13 @@
 # lib/fs: moving the path walk into the fs layer
 
-Status: in progress, 2026-08-24. Phases 0-6 are implemented on this branch:
+Status: complete, 2026-08-24. All seven phases are implemented on this branch:
 the pre-fixes and test expansion of §6 Phase 0, the node tree / vnode
 interface / walk of Phase 1, the memfs conversion plus the
 FS_NODE_CACHE_SIZE LRU of Phase 2, the ext2 conversion of Phase 3, the
 spifs conversion of Phase 4, the FAT conversion of Phase 5 and the 9p
-conversion of Phase 6. Every filesystem in the tree is now on the vnode
-interface, so nothing registers through fs_legacy_api any more. Sections
-below describe the design as proposed; deviations that emerged during
+conversion of Phase 6 and the cleanup of Phase 7. Every filesystem in the
+tree is on the vnode interface and the legacy string-path interface is gone.
+Sections below describe the design as proposed; deviations that emerged during
 implementation:
 
 - the dirhandle holds the directory's *vnode* (plus the fs cursor), not the
@@ -110,9 +110,28 @@ implementation:
 - §5 costed the 9p conversion at +150 bytes; it measures −192 (5,255 → 5,063
   text, arm64 DEBUG=0), and a vnode is ~24 bytes of heap where an open file
   used to cost more than 4KB. The core is untouched by this phase: fs.c is
-  byte-identical, so the §1 budget stands where Phase 3 left it
+  byte-identical, so the §1 budget stood where Phase 3 left it until the
+  cleanup below reclaimed part of it
 
-Phase 7 (cleanup) remains.
+- deleting the legacy adapter took find_mount with it: with no legacy mount to
+  enter, a walk to a mounted path returns a node and find_mount could only
+  return NULL, so mount()'s ERR_ALREADY_MOUNTED precheck was dead. Occupied
+  paths are caught by the scaffold walk instead, which means the rejection now
+  happens after bio_open and api->mount rather than before. That was already
+  true for every vnode filesystem from Phase 1 onward; only the wording of the
+  check changed
+- unmount() is a required op rather than an optional one. It was always called
+  without a NULL check on the teardown paths; only the root-type rejection in
+  mount() pretended otherwise
+- §7's FS_CAP_UNLINK_OPEN is **resolved as not built**: ERR_BUSY is uniform
+  across all five filesystems and nothing in the tree wants POSIX
+  unlink-while-open. The flag is the design if something ever does, and
+  docs/fs.md says so. FS_NODE_CACHE_SIZE is the only build variable the layer
+  grew
+- §1 budgeted +3KB of thumb2 core. Deleting the adapter reclaims 636 bytes:
+  fs.c.o measures 4,007 against the 2,293 baseline, so the layer costs
+  **+1,714 bytes** for the node tree, the walk, mount stitching, refcounting
+  and the node cache
 
 ## 1. Problem and constraints
 
@@ -563,9 +582,10 @@ up `unlink`/`rmdir` via `TREMOVE`. Measure walk RPC counts on a cold and warm tr
 if amplification matters, add the optional multi-component `lookup` the walk can
 use on a run of cache misses.
 
-**Phase 7 — cleanup.** Delete the legacy adapter, `trim_name`, `fs_load_file`.
-Make `FS_NODE_CACHE_SIZE` and any per-fs capability flags documented build
-variables. Write `docs/fs.md` (there is currently no fs documentation in `docs/`).
+**Phase 7 — cleanup.** Delete the legacy adapter and `trim_name` (`fs_load_file`
+went in Phase 0). Make `FS_NODE_CACHE_SIZE` and any per-fs capability flags
+documented build variables. Write `docs/fs.md` (there is currently no fs
+documentation in `docs/`).
 
 ## 7. Open questions
 
@@ -583,6 +603,7 @@ variables. Write `docs/fs.md` (there is currently no fs documentation in `docs/`
   the C filesystems symmetric and lets the layer own allocation; embedding
   (`containerof`) saves one allocation per node. The FAT conversion is the place
   to decide, since it already has a class hierarchy to fit in.
-- **Unlink-while-open.** `ERR_BUSY` everywhere is the proposal. If POSIX semantics
-  are wanted for memfs/ext2-rw later, a `FS_CAP_UNLINK_OPEN` flag on the api lets
-  those filesystems opt in without changing spifs or FAT.
+- **Unlink-while-open.** `ERR_BUSY` everywhere is the proposal, and it is what
+  shipped. If POSIX semantics are wanted for memfs/ext2-rw later, a
+  `FS_CAP_UNLINK_OPEN` flag on the api lets those filesystems opt in without
+  changing spifs or FAT. Not built: nothing in the tree wants it yet.
