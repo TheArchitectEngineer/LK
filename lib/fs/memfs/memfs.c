@@ -378,11 +378,19 @@ static ssize_t memfs_write(struct fs_vnode *vn, const void *buf, off_t off, size
         return 0;
     }
 
+    // the contents are one size_t sized allocation, so a write ending past
+    // what size_t can name cannot be satisfied. Without this off + len
+    // truncates on a 32 bit target and the realloc below is short by 4GB
+    if ((uint64_t)off > (uint64_t)ULONG_MAX - len) {
+        return ERR_NO_MEMORY;
+    }
+    const size_t end = (size_t)off + len;
+
     mutex_acquire(&obj->fs->lock);
 
     // see if this write will extend the file
-    if (off + len > obj->len) {
-        void *ptr = realloc(obj->ptr, off + len);
+    if (end > obj->len) {
+        void *ptr = realloc(obj->ptr, end);
         if (!ptr) {
             mutex_release(&obj->fs->lock);
             return ERR_NO_MEMORY;
@@ -394,7 +402,7 @@ static ssize_t memfs_write(struct fs_vnode *vn, const void *buf, off_t off, size
         }
 
         obj->ptr = ptr;
-        obj->len = off + len;
+        obj->len = end;
     }
 
     memcpy(obj->ptr + off, buf, len);
