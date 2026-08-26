@@ -1202,6 +1202,11 @@ status_t fat_dir_allocate(fat_fs *fat, const uint32_t parent_cluster, const char
         loc->starting_dir_cluster = parent_cluster;
         loc->dir_offset = run_start_offset + static_cast<uint32_t>(lfn_entry_count * DIR_ENTRY_LENGTH);
     }
+    if (record_start_offset) {
+        // the record starts at the first long name entry, or at the short name
+        // entry itself when there are none
+        *record_start_offset = run_start_offset;
+    }
 
     return NO_ERROR;
 }
