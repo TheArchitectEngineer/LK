@@ -132,13 +132,17 @@ blocknum_t ext2_file_block_to_fs_block(ext2_t *ext2, struct ext2_inode *inode, u
 
     uint32_t pos[4];
     uint32_t level = 0;
-    ext2_calculate_block_pointer_pos(ext2, fileblock, &level, pos);
+    if (ext2_calculate_block_pointer_pos(ext2, fileblock, &level, pos) < 0) {
+        /* past the largest block a triple indirect inode can name; nothing is
+         * there, and indexing i_block with it would run off the inode */
+        return 0;
+    }
 
     LTRACEF("level %d, pos 0x%x 0x%x 0x%x 0x%x\n", level, pos[0], pos[1], pos[2], pos[3]);
 
     if (level == 0) {
         /* direct block, just return it directly */
-        block = LE32(inode->i_block[fileblock]);
+        block = LE32(inode->i_block[pos[0]]);
     } else {
         /* at least one level of indirection, get a pointer to the final indirect block table and dereference it */
         blocknum_t *ind_table;

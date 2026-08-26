@@ -34,6 +34,11 @@ ssize_t ext2_read(struct fs_vnode *vn, void *buf, off_t offset, size_t len) {
         return ERR_NOT_FILE;
     }
 
+    /* negative offsets are invalid */
+    if (offset < 0) {
+        return ERR_INVALID_ARGS;
+    }
+
     return ext2_read_inode(v->ext2, &v->inode, buf, offset, len);
 }
 
