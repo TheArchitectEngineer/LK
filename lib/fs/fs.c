@@ -72,6 +72,11 @@ struct fs_mount {
 
     struct fs_vnode *root;      // root vnode
     struct list_node vnodes;    // every live vnode of this mount, for dedup by id
+
+    // fs_unmount has run: the mount is gone as far as the namespace is
+    // concerned and only the deferred teardown behind still-open handles is
+    // outstanding. A second unmount must not drop its references again
+    bool unmounting;
 };
 
 struct filehandle {
@@ -686,6 +691,7 @@ static status_t mount(const char *path, const char *device, const struct fs_impl
     mount->fs = fs;
     mount->api = fs->api;
     mount->root = NULL;
+    mount->unmounting = false;
     list_initialize(&mount->vnodes);
 
     /* walk to the mount point, creating scaffold nodes for any missing
@@ -809,20 +815,30 @@ status_t fs_unmount(const char *path) {
 
     struct fs_mount *mount;
     switch (res.kind) {
-        case FS_WALK_NODE:
-            // only the mount point itself may be unmounted, not a path inside it
-            if (!res.node->mounted) {
-                // scaffolding or a name inside a filesystem
-                node_put(res.node);
+        case FS_WALK_NODE: {
+            mutex_acquire(&fs_lock);
+
+            // only the mount point itself may be unmounted, not a path inside
+            // it, and only once: a mount whose teardown is deferred behind an
+            // open handle has already had these two references spent
+            const bool ours = res.node->mounted && !res.node->mounted->unmounting;
+            if (ours) {
+                DEBUG_ASSERT(res.mount == res.node->mounted);
+                res.node->mounted->unmounting = true;
+            }
+            node_release(res.node);
+            mutex_release(&fs_lock);
+
+            if (!ours) {
+                // scaffolding, a name inside a filesystem, or already unmounted
                 if (res.mount) {
                     put_mount(res.mount);
                 }
                 return ERR_NOT_FOUND;
             }
             mount = res.mount;
-            DEBUG_ASSERT(mount == res.node->mounted);
-            node_put(res.node);
             break;
+        }
         default:
             return res.err;
     }

@@ -365,6 +365,46 @@ static bool test_unmount_with_open_handle(void) {
     END_TEST;
 }
 
+#define DBLU_MNT  "/fs_double_unmount_test"
+#define DBLU_FILE DBLU_MNT "/file"
+
+static void test_double_unmount_teardown(void *ptr) {
+    fs_remove_file(DBLU_FILE);
+    fs_unmount(DBLU_MNT);
+}
+
+// A second unmount of a mount whose teardown is still deferred behind an open
+// handle must not spend its references a second time: doing so drove the count
+// to zero underneath the handle, tearing the filesystem down with a live vnode
+// still on its list.
+static bool test_double_unmount(void) {
+    __attribute__((cleanup(test_double_unmount_teardown))) BEGIN_TEST;
+
+    ASSERT_EQ(NO_ERROR, fs_mount(DBLU_MNT, "memfs", NULL, FS_MOUNT_OPTION_NONE), "mount");
+
+    filehandle *h;
+    ASSERT_EQ(NO_ERROR, fs_create_file(DBLU_FILE, &h, 16), "create");
+
+    status_t err = fs_unmount(DBLU_MNT);
+    ASSERT_TRUE(err == NO_ERROR || err == ERR_BUSY, "first unmount");
+
+    if (err == NO_ERROR) {
+        // the teardown is deferred: the mount is already spoken for and a
+        // second unmount has nothing of its own to return
+        EXPECT_EQ(ERR_NOT_FOUND, fs_unmount(DBLU_MNT), "second unmount");
+        EXPECT_EQ(ERR_NOT_FOUND, fs_unmount(DBLU_MNT), "third unmount");
+    }
+
+    // whatever the first unmount answered, the handle is still live
+    char buf[16];
+    EXPECT_EQ(16, fs_read_file(h, buf, 0, sizeof(buf)), "read after unmount");
+    EXPECT_EQ(NO_ERROR, fs_close_file(h), "close");
+
+    EXPECT_EQ(ERR_NOT_FOUND, fs_open_file(DBLU_FILE, &h), "open after unmount");
+
+    END_TEST;
+}
+
 static void test_rootfs_teardown(void *ptr) {
     fs_unmount("/tmp");
     fs_unmount("/data");
@@ -629,6 +669,7 @@ RUN_TEST(test_hierarchy);
 RUN_TEST(test_shared_object);
 RUN_TEST(test_readdir);
 RUN_TEST(test_unmount_with_open_handle);
+RUN_TEST(test_double_unmount);
 RUN_TEST(test_rootfs);
 RUN_TEST(test_rootfs_live_iter);
 RUN_TEST(test_mount_namespace);
