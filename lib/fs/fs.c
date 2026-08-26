@@ -367,7 +367,7 @@ int fs_get_node_cache_size(void) {
 enum fs_walk_kind {
     FS_WALK_FAILED = 0, // status in err
     FS_WALK_NODE,       // resolved the whole path to a node (ref held); mount
-                        // ref held too unless it is pure scaffolding
+                        // and vnode refs held too unless it is pure scaffolding
     FS_WALK_PARENT,     // stopped at the parent directory inside a filesystem:
                         // node + mount refs held, last is the final component
 };
@@ -377,6 +377,7 @@ struct fs_walk_result {
     status_t err;
     struct fs_mount *mount;
     struct fs_node *node;  // FS_WALK_NODE / FS_WALK_PARENT
+    struct fs_vnode *vnode; // FS_WALK_NODE, ref held; NULL for pure scaffolding
     const char *last;      // FS_WALK_PARENT; points into the caller's buffer
 };
 
@@ -459,8 +460,15 @@ static void fs_walk(char *path, size_t path_size, uint flags, struct fs_walk_res
                 return;
             }
             if (curvn) {
+                // take the vnode reference here, under the lock that the
+                // resolution ran under, rather than leaving the caller to
+                // pick it up afterwards: in that window a concurrent remove
+                // would see a node reference it cannot classify and unlink
+                // the object out from under this walk
                 curvn->mount->ref++;
+                curvn->ref++;
                 res->mount = curvn->mount;
+                res->vnode = curvn;
             }
             mutex_release(&fs_lock);
             res->kind = FS_WALK_NODE;
@@ -571,17 +579,13 @@ static void fs_walk(char *path, size_t path_size, uint flags, struct fs_walk_res
     }
 }
 
-// Consume a FS_WALK_NODE reference, returning a referenced vnode; the node is
-// released (and pruned if nothing else holds it, the vnode surviving through
-// the returned reference).
-static struct fs_vnode *walk_node_to_vnode(struct fs_node *node) {
-    mutex_acquire(&fs_lock);
-    struct fs_vnode *vn = node_vnode(node);
-    DEBUG_ASSERT(vn);
-    vn->ref++;
-    node_release(node);
-    mutex_release(&fs_lock);
-    return vn;
+// Consume a FS_WALK_NODE result, keeping the vnode reference the walk already
+// took; the node is released (and pruned if nothing else holds it, the vnode
+// surviving through the returned reference).
+static struct fs_vnode *walk_node_to_vnode(struct fs_walk_result *res) {
+    DEBUG_ASSERT(res->vnode);
+    node_put(res->node);
+    return res->vnode;
 }
 
 // decrement the ref to the mount structure, which may
@@ -826,6 +830,13 @@ status_t fs_unmount(const char *path) {
                 DEBUG_ASSERT(res.mount == res.node->mounted);
                 res.node->mounted->unmounting = true;
             }
+
+            // the walk's vnode reference has to go back before the mount
+            // references do, or the last put tears the mount down with its
+            // root still referenced
+            if (res.vnode) {
+                vnode_release_locked(res.vnode);
+            }
             node_release(res.node);
             mutex_release(&fs_lock);
 
@@ -869,7 +880,7 @@ status_t fs_open_file(const char *path, filehandle **handle) {
                 node_put(res.node);
                 return ERR_NOT_FOUND;
             }
-            struct fs_vnode *vn = walk_node_to_vnode(res.node);
+            struct fs_vnode *vn = walk_node_to_vnode(&res);
 
             f = malloc(sizeof(*f));
             if (!f) {
@@ -1031,9 +1042,11 @@ static status_t remove_common(const char *path, bool dir) {
                 goto out;
             }
 
-            // the layer refuses to unlink anything with open handles: the
-            // only references a free object can have are our transient one
-            // and its own tree node's
+            // the layer refuses to unlink anything still in use: the only
+            // references a free object can have are our transient one and its
+            // own tree node's. A walk that resolved to it holds one too, which
+            // is what makes a concurrent open visible here rather than a bare
+            // node reference this check could not classify
             if (cvn->ref > 1 + (child ? 1 : 0)) {
                 err = ERR_BUSY;
                 vnode_release_locked(cvn);
@@ -1192,7 +1205,7 @@ status_t fs_open_dir(const char *path, dirhandle **handle) {
                 break;
             }
 
-            struct fs_vnode *vn = walk_node_to_vnode(res.node);
+            struct fs_vnode *vn = walk_node_to_vnode(&res);
             if (vn->type != FS_VNODE_DIR) {
                 vnode_put(vn);
                 put_mount(res.mount);
@@ -1274,6 +1287,7 @@ status_t fs_stat_fs(const char *mountpoint, struct fs_stat *stat) {
             }
             mount = res.mount;
             node_put(res.node);
+            vnode_put(res.vnode);
             break;
         default:
             return res.err;
