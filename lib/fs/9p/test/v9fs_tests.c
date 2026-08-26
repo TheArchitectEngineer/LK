@@ -118,7 +118,26 @@ static bool test_v9fs_mount(void) {
 
     // a second cycle proves unmount really released the attach fid
     ASSERT_TRUE(mount_v9fs(), "second mount");
+
     EXPECT_EQ(NO_ERROR, fs_unmount(V9FS_MOUNT_POINT), "second unmount");
+
+    // Mounting over an occupied point is refused by the layer only after
+    // v9fs_mount has already attached and built a root vnode, so the failure
+    // path has to release that vnode. 9p is the one filesystem whose release()
+    // reaches its instance through the vnode's cookie, which makes this the
+    // case that catches the layer handing it an unbound one. Something other
+    // than 9p has to be holding the point: a second attach to the same device
+    // fails inside the driver, before the layer gets a chance to object.
+    ASSERT_EQ(NO_ERROR, fs_mount(V9FS_MOUNT_POINT, "memfs", NULL, FS_MOUNT_OPTION_NONE),
+              "occupy the mount point");
+    EXPECT_EQ(ERR_ALREADY_MOUNTED,
+              fs_mount(V9FS_MOUNT_POINT, V9FS_NAME, V9P_BDEV_NAME, FS_MOUNT_OPTION_NONE),
+              "mount over an occupied point");
+    EXPECT_EQ(NO_ERROR, fs_unmount(V9FS_MOUNT_POINT), "release the mount point");
+
+    // the refused attempt must have detached cleanly, attach fid and all
+    ASSERT_TRUE(mount_v9fs(), "mount after the refusal");
+    EXPECT_EQ(NO_ERROR, fs_unmount(V9FS_MOUNT_POINT), "final unmount");
 
     END_TEST;
 }

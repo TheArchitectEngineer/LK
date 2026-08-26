@@ -647,16 +647,25 @@ static status_t mount(const char *path, const char *device, const struct fs_impl
     fscookie *cookie;
     struct fs_vnode *root = NULL;
     status_t err = fs->api->mount(dev, options, &cookie, &root);
-    if (err >= 0 && (!root || root->type != FS_VNODE_DIR)) {
-        // a filesystem must produce a directory as its root
-        fs->api->unmount(cookie);
-        err = ERR_NOT_VALID;
-    }
     if (err < 0) {
         if (dev) {
             bio_close(dev);
         }
         return err;
+    }
+
+    // Bind the root to its filesystem now rather than leaving it to
+    // vnode_adopt_locked at the end: every error unwind from here on calls
+    // release(), and a filesystem is entitled to reach its own instance
+    // through the cookie there.
+    if (root) {
+        root->cookie = cookie;
+    }
+
+    if (!root || root->type != FS_VNODE_DIR) {
+        // a filesystem must produce a directory as its root
+        err = ERR_NOT_VALID;
+        goto err_unmount;
     }
 
     /* create the mount structure */
