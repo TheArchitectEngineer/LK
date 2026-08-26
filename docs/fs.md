@@ -140,10 +140,17 @@ follows a symlink) and **not** across `read`, `write`, `truncate`, `stat` or
 
 Holding it across `lookup` means a lookup that does I/O serializes the whole
 layer — ext2 holds it across bcache reads, spifs across a flash erase and ToC
-commit. Every in-tree filesystem already serialized on a per-mount mutex and the
-9p transport allows one outstanding RPC, so this costs nothing today. If a real
-target ever shows contention, the upgrade path is a per-node busy flag: mark the
-node, drop the lock around the filesystem call, wake waiters afterwards.
+commit. memfs, spifs, FAT and 9p each already serialized on a per-mount mutex
+(and the 9p transport allows one outstanding RPC besides), so for those this
+costs nothing today. If a real target ever shows contention, the upgrade path is
+a per-node busy flag: mark the node, drop the lock around the filesystem call,
+wake waiters afterwards.
+
+ext2 is the exception: it has no per-mount lock, and neither does the `lib/bcache`
+it reads through. Its namespace ops are safe because `fs_lock` covers them, but
+`read`, `stat`, `readdir` and `readlink` run outside that lock, so two threads
+reading one ext2 mount concurrently race in the block cache. Treat an ext2 mount
+as single-reader until it grows a lock of its own.
 
 ## Writing a filesystem
 
