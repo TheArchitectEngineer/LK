@@ -405,6 +405,45 @@ static bool test_double_unmount(void) {
     END_TEST;
 }
 
+#define ABOVE_BASE "/fs_mount_above_test"
+
+static void test_mount_above_teardown(void *ptr) {
+    fs_unmount(ABOVE_BASE "/a/b");
+    fs_unmount(ABOVE_BASE "/a");
+}
+
+// Mounting over scaffolding that already leads to a mount would shadow it: the
+// covering filesystem answers every lookup while the mount underneath stays in
+// the mount list and keeps its files alive, so listing and resolution disagree.
+static bool test_mount_above(void) {
+    __attribute__((cleanup(test_mount_above_teardown))) BEGIN_TEST;
+
+    ASSERT_EQ(NO_ERROR, fs_mount(ABOVE_BASE "/a/b", "memfs", NULL, FS_MOUNT_OPTION_NONE),
+              "deep mount");
+
+    // both the scaffolding directly above the mount and the level above that
+    EXPECT_EQ(ERR_ALREADY_MOUNTED,
+              fs_mount(ABOVE_BASE "/a", "memfs", NULL, FS_MOUNT_OPTION_NONE),
+              "mount directly above");
+    EXPECT_EQ(ERR_ALREADY_MOUNTED,
+              fs_mount(ABOVE_BASE, "memfs", NULL, FS_MOUNT_OPTION_NONE),
+              "mount further above");
+
+    // the refusal must not have disturbed what is already there
+    filehandle *h;
+    ASSERT_EQ(NO_ERROR, fs_create_file(ABOVE_BASE "/a/b/file", &h, 16), "create below");
+    EXPECT_EQ(NO_ERROR, fs_close_file(h), "close");
+    EXPECT_EQ(NO_ERROR, fs_remove_file(ABOVE_BASE "/a/b/file"), "remove below");
+
+    // once the subtree is empty the same path is free again
+    ASSERT_EQ(NO_ERROR, fs_unmount(ABOVE_BASE "/a/b"), "unmount");
+    EXPECT_EQ(NO_ERROR, fs_mount(ABOVE_BASE "/a", "memfs", NULL, FS_MOUNT_OPTION_NONE),
+              "mount above once free");
+    EXPECT_EQ(NO_ERROR, fs_unmount(ABOVE_BASE "/a"), "unmount again");
+
+    END_TEST;
+}
+
 static void test_rootfs_teardown(void *ptr) {
     fs_unmount("/tmp");
     fs_unmount("/data");
@@ -670,6 +709,7 @@ RUN_TEST(test_shared_object);
 RUN_TEST(test_readdir);
 RUN_TEST(test_unmount_with_open_handle);
 RUN_TEST(test_double_unmount);
+RUN_TEST(test_mount_above);
 RUN_TEST(test_rootfs);
 RUN_TEST(test_rootfs_live_iter);
 RUN_TEST(test_mount_namespace);

@@ -740,7 +740,11 @@ static status_t mount(const char *path, const char *device, const struct fs_impl
         pos = comp + len;
     }
 
-    if (cur->mounted || cur->vnode) {
+    // Children on a node that has no vnode of its own mean scaffolding, and the
+    // walk above only ever builds scaffolding on the way to a mount, so a mount
+    // lives somewhere below here. Covering it would leave a namespace whose
+    // listing and whose resolution disagree about what is at this path.
+    if (cur->mounted || cur->vnode || !list_is_empty(&cur->children)) {
         node_release(cur);
         mutex_release(&fs_lock);
         free(mount->path);
