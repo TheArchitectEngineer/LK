@@ -75,6 +75,13 @@ EfiStatus efi_initialize_system_table_pointer(struct EfiSystemTable *system_tabl
   return EFI_STATUS_SUCCESS;
 }
 
+void efi_uninitialize_system_table_pointer() {
+  if (efi_systab_pointer != nullptr) {
+    free_pages(efi_systab_pointer, 1);
+    efi_systab_pointer = nullptr;
+  }
+}
+
 static uint32_t efi_m_max_table_entries;
 
 static constexpr size_t EFI_DEBUG_TABLE_ENTRY_SIZE = (sizeof(union EfiDebugImageInfo));
