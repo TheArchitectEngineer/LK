@@ -258,6 +258,12 @@ void teardown_debug_support(char *image_base) {
       free_pool(device_buf);
       free_pool(efiLoadedImageProtocol);
 
+      if (efi_m_debug_info_table_header.table_size == 0) {
+        free_pool(efi_m_debug_info_table_header.efi_debug_image_info_table);
+        efi_m_debug_info_table_header = {};
+        efi_m_max_table_entries = 0;
+      }
+
       return;
     }
   }
