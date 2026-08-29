@@ -139,7 +139,7 @@ EfiStatus efi_core_new_debug_image_info_entry(uint32_t image_info_type,
 
   /* Allocate data for new entry. */
   allocate_pool(EFI_MEMORY_TYPE_BOOT_SERVICES_DATA,
-		      sizeof(union EfiDebugImageInfo),
+		      sizeof(struct EfiDebugImageInfoNormal),
 		      reinterpret_cast<void **>(&table[index].normal_image));
   if (table[index].normal_image) {
     /* Update the entry. */
