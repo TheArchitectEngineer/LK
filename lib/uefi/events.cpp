@@ -73,7 +73,8 @@ void process_pending_events() {
     }
   }
   al.release();
-  list_for_every_entry(&completed_events, ev, EfiEventImpl, node) {
+  while ((ev = list_remove_head_type(&completed_events, EfiEventImpl, node)) !=
+         nullptr) {
     invoke_callback(ev);
   }
 }
