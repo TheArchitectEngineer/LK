@@ -5,10 +5,10 @@ MODULE := $(LOCAL_DIR)
 MODULE_DEPS += lib/bio
 MODULE_DEPS += lib/cmdline
 MODULE_DEPS += lib/fs
-MODULE_DEPS += lib/fs/9p
+MODULE_DEPS += lib/fs/ext2
+MODULE_DEPS += lib/fs/memfs
 MODULE_DEPS += lib/unittest
 
-MODULE_SRCS += $(LOCAL_DIR)/v9fs_tests.c
-MODULE_SRCS += $(LOCAL_DIR)/v9p_tests.c
+MODULE_SRCS += $(LOCAL_DIR)/ext2_tests.c
 
 include make/module.mk

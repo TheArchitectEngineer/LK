@@ -40,8 +40,11 @@
     _(test_corrupt_toc, 1, "Test that FS can be mounted with one corrupt ToC.")  \
     _(test_write_with_offset, 1, "Test that files can be written to at an offset.") \
     _(test_read_write_big, 1, "Test that an unaligned ~10kb buffer can be written and read.") \
+    _(test_flat_semantics, 1, "Test flat namespace error semantics through the fs layer.") \
     _(test_rm_active_dirent, 1, "Test that we can remove a file with an open dirent.") \
+    _(test_rm_while_open, 1, "Test that removing an open file is refused with ERR_BUSY.") \
     _(test_truncate_file, 1, "Test that we can truncate a file.")                \
+    _(test_file_ioctl, 1, "Test the linear mapping ioctls.")                     \
     _(test_remount, 1, "Test that files survive an unmount/mount cycle.")
 
 #define SPIFS_DECLARE_TEST(fn, toc, desc) static bool fn(const char *);
@@ -565,6 +568,34 @@ err:
     return success;
 }
 
+// A flat filesystem's contract as seen through the fs layer: mkdir is
+// ERR_NOT_SUPPORTED because the filesystem has no such op, a path through a
+// name that does not exist is ERR_NOT_FOUND (the layer's walk fails on the
+// missing component before spifs is asked anything), missing names are
+// ERR_NOT_FOUND, and the mount root is the one openable directory.
+static bool test_flat_semantics(const char *dev_name) {
+    filehandle *h;
+    if (fs_make_dir(MNT_PATH "/sub") != ERR_NOT_SUPPORTED) {
+        return false;
+    }
+    if (fs_create_file(MNT_PATH "/sub/file", &h, 0) != ERR_NOT_FOUND) {
+        return false;
+    }
+
+    if (fs_open_file(MNT_PATH "/nope", &h) != ERR_NOT_FOUND) {
+        return false;
+    }
+    dirhandle *dh;
+    if (fs_open_dir(MNT_PATH "/nope", &dh) != ERR_NOT_FOUND) {
+        return false;
+    }
+
+    if (fs_open_dir(MNT_PATH, &dh) != NO_ERROR) {
+        return false;
+    }
+    return fs_close_dir(dh) == NO_ERROR;
+}
+
 static bool test_rm_active_dirent(const char *dev_name) {
     filehandle *handle;
     status_t status = fs_create_file(TEST_FILE_PATH, &handle, 0);
@@ -602,6 +633,47 @@ static bool test_rm_active_dirent(const char *dev_name) {
     return success;
 }
 
+static bool test_rm_while_open(const char *dev_name) {
+    filehandle *handle;
+    if (fs_create_file(TEST_FILE_PATH, &handle, 16) != NO_ERROR) {
+        return false;
+    }
+
+    // Removing a file with an open handle must be refused, not freed under it...
+    if (fs_remove_file(TEST_FILE_PATH) != ERR_BUSY) {
+        fs_close_file(handle);
+        return false;
+    }
+
+    // ...and the handle must still be usable afterwards.
+    char buf[16];
+    if (fs_read_file(handle, buf, 0, sizeof(buf)) != (ssize_t)sizeof(buf)) {
+        fs_close_file(handle);
+        return false;
+    }
+
+    // A second open of the same file holds it busy on its own.
+    filehandle *handle2;
+    if (fs_open_file(TEST_FILE_PATH, &handle2) != NO_ERROR) {
+        fs_close_file(handle);
+        return false;
+    }
+    if (fs_close_file(handle) != NO_ERROR) {
+        fs_close_file(handle2);
+        return false;
+    }
+    if (fs_remove_file(TEST_FILE_PATH) != ERR_BUSY) {
+        fs_close_file(handle2);
+        return false;
+    }
+    if (fs_close_file(handle2) != NO_ERROR) {
+        return false;
+    }
+
+    // With every handle closed the remove goes through.
+    return fs_remove_file(TEST_FILE_PATH) == NO_ERROR;
+}
+
 static bool test_truncate_file(const char *dev_name) {
     filehandle *handle;
     status_t status =
@@ -628,6 +700,68 @@ static bool test_truncate_file(const char *dev_name) {
     }
 
     return fs_close_file(handle) == NO_ERROR;
+}
+
+// The linear mapping ioctls, which is how app/moot executes a boot image in
+// place out of SPI flash. The unit test device is RAM backed, so a `ut` run
+// always takes the strict branch: the mapping resolves and the bytes have to
+// match. The ERR_NOT_SUPPORTED branch exists only for the console command,
+// which may be pointed at a device that cannot map, and where the dispatch
+// under test is still what is being exercised.
+static bool test_file_ioctl(const char *dev_name) {
+    static const char message[] = "ioctl";
+
+    filehandle *handle;
+    if (fs_create_file(TEST_FILE_PATH, &handle, sizeof(message)) != NO_ERROR) {
+        return false;
+    }
+    if (fs_write_file(handle, message, 0, sizeof(message)) != (ssize_t)sizeof(message)) {
+        fs_close_file(handle);
+        return false;
+    }
+
+    bool success = false;
+    bool is_linear = false;
+    void *addr = NULL;
+
+    status_t status = fs_file_ioctl(handle, FS_IOCTL_IS_LINEAR, &is_linear);
+    if (status != NO_ERROR && status != ERR_NOT_SUPPORTED) {
+        goto done;
+    }
+
+    status = fs_file_ioctl(handle, FS_IOCTL_GET_FILE_ADDR, &addr);
+    if (status == NO_ERROR) {
+        // the address has to name the file's own contents
+        if (!addr || memcmp(addr, message, sizeof(message)) != 0) {
+            goto done;
+        }
+    } else if (status != ERR_NOT_SUPPORTED) {
+        goto done;
+    }
+
+    success = true;
+
+done:
+    if (fs_close_file(handle) != NO_ERROR) {
+        success = false;
+    }
+
+    // The mount root is a directory. Opening it as a file is allowed, but the
+    // ioctl has to be refused rather than followed into a file that isn't there.
+    filehandle *roothandle;
+    if (fs_open_file(MNT_PATH, &roothandle) == NO_ERROR) {
+        void *rootaddr;
+        if (fs_file_ioctl(roothandle, FS_IOCTL_GET_FILE_ADDR, &rootaddr) >= 0) {
+            success = false;
+        }
+        fs_close_file(roothandle);
+    }
+
+    if (fs_remove_file(TEST_FILE_PATH) != NO_ERROR) {
+        success = false;
+    }
+
+    return success;
 }
 
 // A file's capacity is rounded up to a whole page (spifs_create()), so a one

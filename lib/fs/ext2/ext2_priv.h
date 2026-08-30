@@ -23,42 +23,43 @@ typedef struct {
     struct ext2_super_block sb;
     int s_group_count;
     struct ext2_group_desc *gd;
-    struct ext2_inode root_inode;
 } ext2_t;
 
-struct cache_block {
-    blocknum_t num;
-    void *ptr;
-};
-
-/* open file handle */
+/* One filesystem object, hanging off the layer's vnode as its private data.
+ * The inode is kept by value: the layer deduplicates vnodes by inode number,
+ * so there is exactly one of these per object in use, and the filesystem is
+ * read-only, so the copy can never go stale. */
 typedef struct {
     ext2_t *ext2;
-
-    struct cache_block ind_cache[3]; // cache of indirect blocks as they're scanned
+    inodenum_t inum;
     struct ext2_inode inode;
-} ext2_file_t;
+} ext2_vnode_t;
 
 /* internal routines */
 int ext2_load_inode(ext2_t *ext2, inodenum_t num, struct ext2_inode *inode);
-int ext2_lookup(ext2_t *ext2, const char *path, inodenum_t *inum); // path to inode
+status_t ext2_create_vnode(ext2_t *ext2, inodenum_t inum, struct fs_vnode **out);
 
 /* io */
 int ext2_read_block(ext2_t *ext2, void *buf, blocknum_t bnum);
 int ext2_get_block(ext2_t *ext2, void **ptr, blocknum_t bnum);
 int ext2_put_block(ext2_t *ext2, blocknum_t bnum);
+blocknum_t ext2_file_block_to_fs_block(ext2_t *ext2, struct ext2_inode *inode, uint fileblock);
 
 off_t ext2_file_len(ext2_t *ext2, struct ext2_inode *inode);
 ssize_t ext2_read_inode(ext2_t *ext2, struct ext2_inode *inode, void *buf, off_t offset, size_t len);
-int ext2_read_link(ext2_t *ext2, struct ext2_inode *inode, char *str, size_t len);
 
 /* fs api */
-status_t ext2_mount(bdev_t *dev, fscookie **cookie, enum fs_mount_options options);
+status_t ext2_mount(bdev_t *dev, enum fs_mount_options options, fscookie **cookie,
+                    struct fs_vnode **root);
 status_t ext2_unmount(fscookie *cookie);
-status_t ext2_open_file(fscookie *cookie, const char *path, filecookie **fcookie);
-ssize_t ext2_read_file(filecookie *fcookie, void *buf, off_t offset, size_t len);
-status_t ext2_close_file(filecookie *fcookie);
-status_t ext2_stat_file(filecookie *fcookie, struct file_stat *);
+status_t ext2_lookup(struct fs_vnode *dir, const char *name, struct fs_vnode **out);
+void ext2_release(struct fs_vnode *vn);
+ssize_t ext2_read(struct fs_vnode *vn, void *buf, off_t offset, size_t len);
+ssize_t ext2_readlink(struct fs_vnode *vn, char *buf, size_t len);
+status_t ext2_stat(struct fs_vnode *vn, struct file_stat *stat);
+status_t ext2_opendir(struct fs_vnode *vn, dircookie **cookie);
+status_t ext2_readdir(dircookie *cookie, struct dirent *ent);
+status_t ext2_closedir(dircookie *cookie);
 
 /* mode stuff */
 #define S_IFMT   0170000
