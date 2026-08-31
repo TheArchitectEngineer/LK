@@ -2,6 +2,7 @@ LOCAL_DIR := $(GET_LOCAL_DIR)
 
 MODULE := $(LOCAL_DIR)
 
+MODULE_DEPS += kernel
 MODULE_DEPS += lib/bio
 MODULE_DEPS += lib/cmdline
 MODULE_DEPS += lib/fs

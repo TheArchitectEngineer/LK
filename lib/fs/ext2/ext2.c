@@ -7,6 +7,8 @@
  */
 
 #include "ext2_priv.h"
+#include <assert.h>
+#include <kernel/mutex.h>
 #include <lib/fs.h>
 #include <lk/debug.h>
 #include <lk/err.h>
@@ -113,6 +115,7 @@ status_t ext2_mount(bdev_t *dev, enum fs_mount_options options, fscookie **cooki
     ext2->dev = dev;
     ext2->gd = NULL;
     ext2->cache = NULL;
+    mutex_init(&ext2->lock);
 
     err = bio_read(dev, &ext2->sb, 1024, sizeof(struct ext2_super_block));
     if (err < 0) {
@@ -186,8 +189,15 @@ status_t ext2_mount(bdev_t *dev, enum fs_mount_options options, fscookie **cooki
         goto err;
     }
 
-    /* build the root vnode, which also validates that the root inode reads */
+    /* Build the root vnode, which also validates that the root inode reads.
+     * This is the only step of the mount that goes through the block cache --
+     * the superblock and group descriptors above are read straight off the
+     * device -- so it is the only one that needs the lock. Nothing else can
+     * reach the mount yet; the lock is here to satisfy the block cache
+     * routines, which assert on it. */
+    mutex_acquire(&ext2->lock);
     err = ext2_create_vnode(ext2, EXT2_ROOT_INO, root);
+    mutex_release(&ext2->lock);
     if (err < 0) {
         goto err;
     }
@@ -204,16 +214,22 @@ err:
     if (ext2->cache) {
         bcache_destroy(ext2->cache);
     }
+    mutex_destroy(&ext2->lock);
     free(ext2->gd);
     free(ext2);
     return err;
 }
 
+/* The layer calls this only once the mount's last reference has gone and every
+ * vnode of it has been released, so no thread can be inside a filesystem op or
+ * blocked on the lock, and tearing both the lock and the cache down here is
+ * safe. */
 status_t ext2_unmount(fscookie *cookie) {
     // free it up
     ext2_t *ext2 = (ext2_t *)cookie;
 
     bcache_destroy(ext2->cache);
+    mutex_destroy(&ext2->lock);
     free(ext2->gd);
     free(ext2);
 
@@ -236,6 +252,8 @@ static void get_inode_addr(ext2_t *ext2, inodenum_t num, blocknum_t *block, size
 
 int ext2_load_inode(ext2_t *ext2, inodenum_t num, struct ext2_inode *inode) {
     int err;
+
+    DEBUG_ASSERT(is_mutex_held(&ext2->lock));
 
     LTRACEF("num %d, inode %p\n", num, inode);
 

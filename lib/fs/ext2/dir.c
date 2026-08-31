@@ -6,6 +6,7 @@
  * https://opensource.org/licenses/MIT
  */
 #include "ext2_priv.h"
+#include <kernel/mutex.h>
 #include <lk/debug.h>
 #include <lk/err.h>
 #include <lk/trace.h>
@@ -68,7 +69,7 @@ static uint dirent_len(const struct ext2_dir_entry_2 *ent, uint pos, uint32_t bl
 
 /* Find one name in a directory, one component of a path resolved by the fs
  * layer's walk. */
-status_t ext2_lookup(struct fs_vnode *dirvn, const char *name, struct fs_vnode **out) {
+static status_t ext2_lookup_locked(struct fs_vnode *dirvn, const char *name, struct fs_vnode **out) {
     ext2_vnode_t *dir = dirvn->priv;
     ext2_t *ext2 = dir->ext2;
     uint32_t block_size = EXT2_BLOCK_SIZE(ext2->sb);
@@ -125,6 +126,16 @@ status_t ext2_lookup(struct fs_vnode *dirvn, const char *name, struct fs_vnode *
     return ERR_TOO_BIG;
 }
 
+status_t ext2_lookup(struct fs_vnode *dirvn, const char *name, struct fs_vnode **out) {
+    ext2_vnode_t *dir = dirvn->priv;
+
+    mutex_acquire(&dir->ext2->lock);
+    status_t err = ext2_lookup_locked(dirvn, name, out);
+    mutex_release(&dir->ext2->lock);
+
+    return err;
+}
+
 /* An open directory is just a byte offset into it; the entries are read
  * straight out of the block cache. */
 typedef struct {
@@ -132,6 +143,8 @@ typedef struct {
     off_t offset;
 } ext2_dircookie_t;
 
+/* No lock: the inode is held by value, so nothing here reaches the block
+ * cache. */
 status_t ext2_opendir(struct fs_vnode *dirvn, dircookie **cookie) {
     ext2_vnode_t *dir = dirvn->priv;
 
@@ -163,7 +176,7 @@ static bool is_dot_entry(const char *name, uint namelen) {
     return false;
 }
 
-status_t ext2_readdir(dircookie *cookie, struct dirent *ent_out) {
+static status_t ext2_readdir_locked(dircookie *cookie, struct dirent *ent_out) {
     ext2_dircookie_t *dcookie = (ext2_dircookie_t *)cookie;
     ext2_t *ext2 = dcookie->dir->ext2;
     uint32_t block_size = EXT2_BLOCK_SIZE(ext2->sb);
@@ -223,6 +236,19 @@ status_t ext2_readdir(dircookie *cookie, struct dirent *ent_out) {
             return NO_ERROR;
         }
     }
+}
+
+/* Holding the lock across the whole scan also makes the cursor advance
+ * atomically, so two threads sharing one directory handle each see a distinct
+ * entry rather than both reading from the same offset. */
+status_t ext2_readdir(dircookie *cookie, struct dirent *ent_out) {
+    ext2_dircookie_t *dcookie = (ext2_dircookie_t *)cookie;
+
+    mutex_acquire(&dcookie->dir->ext2->lock);
+    status_t err = ext2_readdir_locked(cookie, ent_out);
+    mutex_release(&dcookie->dir->ext2->lock);
+
+    return err;
 }
 
 status_t ext2_closedir(dircookie *cookie) {

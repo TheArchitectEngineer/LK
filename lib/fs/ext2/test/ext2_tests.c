@@ -6,6 +6,7 @@
  * https://opensource.org/licenses/MIT
  */
 
+#include <kernel/thread.h>
 #include <lib/bio.h>
 #include <lib/cmdline.h>
 #include <lib/fs.h>
@@ -455,6 +456,90 @@ static bool test_ext2_readonly_ops(void) {
     END_TEST;
 }
 
+// A handful of threads reading one mount at once. The driver serializes on a
+// per-mount lock, without which they would race in the shared block cache and,
+// because that cache holds only four blocks and asserts once every one of them
+// is referenced, could exhaust it outright. Each reader walks the path afresh
+// every iteration so lookup runs concurrently too, and the windows are spread
+// across the file so the readers contend for different indirect blocks.
+#define CONCURRENT_READERS 4
+#define CONCURRENT_ITERATIONS 8
+#define CONCURRENT_WINDOW (16 * 1024)
+#define CONCURRENT_SEED 0x2222  // the seed pattern_large.bin was built with
+
+// Reads one window of pattern_large.bin, whose offset the argument points at.
+// Returns NO_ERROR only if every byte of every read matched the pattern.
+static int concurrent_reader(void *raw) {
+    const uint64_t offset = *(const uint64_t *)raw;
+
+    uint8_t *buf = malloc(CONCURRENT_WINDOW);
+    if (!buf) {
+        return ERR_NO_MEMORY;
+    }
+
+    int result = NO_ERROR;
+    for (uint i = 0; i < CONCURRENT_ITERATIONS && result == NO_ERROR; i++) {
+        filehandle *h;
+        result = fs_open_file(test_path "/pattern_large.bin", &h);
+        if (result != NO_ERROR) {
+            break;
+        }
+
+        ssize_t r = fs_read_file(h, buf, offset, CONCURRENT_WINDOW);
+        fs_close_file(h);
+        if (r != (ssize_t)CONCURRENT_WINDOW) {
+            result = ERR_IO;
+            break;
+        }
+
+        for (size_t j = 0; j < CONCURRENT_WINDOW; j++) {
+            if (buf[j] != pattern_byte(CONCURRENT_SEED, offset + j)) {
+                result = ERR_CHECKSUM_FAIL;
+                break;
+            }
+        }
+    }
+
+    free(buf);
+    return result;
+}
+
+static bool test_ext2_concurrent_readers(void) {
+    BEGIN_TEST;
+    SKIP_TEST_IF_NO_DEVICE();
+
+    ASSERT_TRUE(mount_test_fs(), "mount");
+
+    uint64_t offsets[CONCURRENT_READERS];
+    thread_t *threads[CONCURRENT_READERS];
+    uint started = 0;
+
+    for (uint i = 0; i < CONCURRENT_READERS; i++) {
+        offsets[i] = (uint64_t)i * 1024 * 1024;
+
+        char name[32];
+        snprintf(name, sizeof(name), "ext2 reader %u", i);
+        threads[i] = thread_create(name, concurrent_reader, &offsets[i],
+                                   DEFAULT_PRIORITY, DEFAULT_STACK_SIZE);
+        if (!threads[i]) {
+            break;
+        }
+        started++;
+        thread_resume(threads[i]);
+    }
+
+    for (uint i = 0; i < started; i++) {
+        int retcode = ERR_GENERIC;
+        EXPECT_EQ(NO_ERROR, thread_join(threads[i], &retcode, INFINITE_TIME), "join");
+        EXPECT_EQ(NO_ERROR, retcode, "reader result");
+    }
+    EXPECT_EQ(CONCURRENT_READERS, started, "all readers started");
+
+    EXPECT_EQ(NO_ERROR, fs_unmount(test_path), "unmount");
+
+    END_TEST;
+}
+
 BEGIN_TEST_CASE(ext2_tests)
 RUN_TEST(test_ext2_mount)
 RUN_TEST(test_ext2_read_files)
@@ -464,4 +549,5 @@ RUN_TEST(test_ext2_absolute_symlink)
 RUN_TEST(test_ext2_dirs)
 RUN_TEST(test_ext2_readdir)
 RUN_TEST(test_ext2_readonly_ops)
+RUN_TEST(test_ext2_concurrent_readers)
 END_TEST_CASE(ext2_tests)

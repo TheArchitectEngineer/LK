@@ -8,6 +8,7 @@
 #pragma once
 
 #include "ext2_fs.h"
+#include <kernel/mutex.h>
 #include <lib/bcache.h>
 #include <lib/bio.h>
 #include <lib/fs.h>
@@ -19,6 +20,21 @@ typedef uint32_t groupnum_t;
 typedef struct {
     bdev_t *dev;
     bcache_t cache;
+
+    /* Serializes everything that touches the block cache, which has no locking
+     * of its own. Without it a block one thread is reading can be evicted and
+     * refilled by another between the lookup and the copy, so a pointer from
+     * bcache_get_block() names another block's contents. The cache also holds
+     * only a handful of blocks and asserts when every one of them is
+     * referenced, which concurrent readers of one mount could exhaust.
+     *
+     * The superblock and group descriptors below are filled in during mount and
+     * never written again, so reading them needs no lock.
+     *
+     * The fs layer holds its own lock across the namespace ops it calls here,
+     * so the order is always the layer's lock and then this one; nothing in
+     * this driver calls back into the layer while holding it. */
+    mutex_t lock;
 
     struct ext2_super_block sb;
     int s_group_count;
@@ -35,7 +51,8 @@ typedef struct {
     struct ext2_inode inode;
 } ext2_vnode_t;
 
-/* internal routines */
+/* internal routines; everything that reaches the block cache requires
+ * ext2->lock, which the routines that take it assert on entry */
 int ext2_load_inode(ext2_t *ext2, inodenum_t num, struct ext2_inode *inode);
 status_t ext2_create_vnode(ext2_t *ext2, inodenum_t inum, struct fs_vnode **out);
 
@@ -45,8 +62,10 @@ int ext2_get_block(ext2_t *ext2, void **ptr, blocknum_t bnum);
 int ext2_put_block(ext2_t *ext2, blocknum_t bnum);
 blocknum_t ext2_file_block_to_fs_block(ext2_t *ext2, struct ext2_inode *inode, uint fileblock);
 
-off_t ext2_file_len(ext2_t *ext2, struct ext2_inode *inode);
 ssize_t ext2_read_inode(ext2_t *ext2, struct ext2_inode *inode, void *buf, off_t offset, size_t len);
+
+/* reads only the inode and the superblock, so it needs no lock */
+off_t ext2_file_len(ext2_t *ext2, struct ext2_inode *inode);
 
 /* fs api */
 status_t ext2_mount(bdev_t *dev, enum fs_mount_options options, fscookie **cookie,

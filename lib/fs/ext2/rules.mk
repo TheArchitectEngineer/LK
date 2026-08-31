@@ -3,6 +3,7 @@ LOCAL_DIR := $(GET_LOCAL_DIR)
 MODULE := $(LOCAL_DIR)
 
 MODULE_DEPS += \
+	kernel \
 	lib/fs \
 	lib/bcache \
 	lib/bio

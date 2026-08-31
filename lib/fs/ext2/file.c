@@ -7,6 +7,7 @@
  */
 
 #include "ext2_priv.h"
+#include <kernel/mutex.h>
 #include <lk/debug.h>
 #include <lk/err.h>
 #include <lk/trace.h>
@@ -39,9 +40,15 @@ ssize_t ext2_read(struct fs_vnode *vn, void *buf, off_t offset, size_t len) {
         return ERR_INVALID_ARGS;
     }
 
-    return ext2_read_inode(v->ext2, &v->inode, buf, offset, len);
+    mutex_acquire(&v->ext2->lock);
+    ssize_t ret = ext2_read_inode(v->ext2, &v->inode, buf, offset, len);
+    mutex_release(&v->ext2->lock);
+
+    return ret;
 }
 
+/* No lock: the inode is held by value and the filesystem is read-only, so
+ * nothing here reaches the block cache. */
 status_t ext2_stat(struct fs_vnode *vn, struct file_stat *stat) {
     ext2_vnode_t *v = vn->priv;
 
@@ -52,7 +59,8 @@ status_t ext2_stat(struct fs_vnode *vn, struct file_stat *stat) {
 }
 
 /* Read a symlink target. Short targets live inline in the inode's block
- * pointer array, longer ones in the file's data blocks. */
+ * pointer array, longer ones in the file's data blocks -- and only that longer
+ * case reaches the block cache, so it is the only one that takes the lock. */
 ssize_t ext2_readlink(struct fs_vnode *vn, char *buf, size_t len) {
     ext2_vnode_t *v = vn->priv;
 
@@ -71,7 +79,9 @@ ssize_t ext2_readlink(struct fs_vnode *vn, char *buf, size_t len) {
     }
 
     if (linklen > (off_t)sizeof(v->inode.i_block)) {
+        mutex_acquire(&v->ext2->lock);
         ssize_t err = ext2_read_inode(v->ext2, &v->inode, buf, 0, linklen);
+        mutex_release(&v->ext2->lock);
         if (err < 0) {
             return err;
         }

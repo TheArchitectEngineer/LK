@@ -140,17 +140,22 @@ follows a symlink) and **not** across `read`, `write`, `truncate`, `stat` or
 
 Holding it across `lookup` means a lookup that does I/O serializes the whole
 layer — ext2 holds it across bcache reads, spifs across a flash erase and ToC
-commit. memfs, spifs, FAT and 9p each already serialized on a per-mount mutex
-(and the 9p transport allows one outstanding RPC besides), so for those this
-costs nothing today. If a real target ever shows contention, the upgrade path is
-a per-node busy flag: mark the node, drop the lock around the filesystem call,
-wake waiters afterwards.
+commit. memfs, spifs, ext2, FAT and 9p each serialize on a per-mount mutex of
+their own (and the 9p transport allows one outstanding RPC besides), so for those
+this costs nothing today. If a real target ever shows contention, the upgrade
+path is a per-node busy flag: mark the node, drop the lock around the filesystem
+call, wake waiters afterwards.
 
-ext2 is the exception: it has no per-mount lock, and neither does the `lib/bcache`
-it reads through. Its namespace ops are safe because `fs_lock` covers them, but
-`read`, `stat`, `readdir` and `readlink` run outside that lock, so two threads
-reading one ext2 mount concurrently race in the block cache. Treat an ext2 mount
-as single-reader until it grows a lock of its own.
+A per-mount lock is what makes the ops that run outside `fs_lock` — `read`,
+`readdir`, `readlink` — safe on a filesystem that reads through `lib/bcache`,
+which has no locking of its own. Two threads in the cache at once can have a
+block evicted and refilled underneath them, so a pointer from
+`bcache_get_block()` ends up naming another block's contents; and because an
+instance is only a handful of blocks and asserts when every one is referenced,
+concurrent readers of one mount can exhaust it outright. ext2 takes its lock in
+exactly the ops that reach the cache and asserts on it in the routines that touch
+the cache; `stat`, `opendir` and `closedir` need no lock because the inode is
+held by value in the vnode.
 
 ## Writing a filesystem
 

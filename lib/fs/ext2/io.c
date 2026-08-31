@@ -7,6 +7,8 @@
  */
 
 #include "ext2_priv.h"
+#include <assert.h>
+#include <kernel/mutex.h>
 #include <lk/debug.h>
 #include <lk/trace.h>
 #include <stdlib.h>
@@ -15,14 +17,17 @@
 #define LOCAL_TRACE 0
 
 int ext2_read_block(ext2_t *ext2, void *buf, blocknum_t bnum) {
+    DEBUG_ASSERT(is_mutex_held(&ext2->lock));
     return bcache_read_block(ext2->cache, buf, bnum);
 }
 
 int ext2_get_block(ext2_t *ext2, void **ptr, blocknum_t bnum) {
+    DEBUG_ASSERT(is_mutex_held(&ext2->lock));
     return bcache_get_block(ext2->cache, ptr, bnum);
 }
 
 int ext2_put_block(ext2_t *ext2, blocknum_t bnum) {
+    DEBUG_ASSERT(is_mutex_held(&ext2->lock));
     return bcache_put_block(ext2->cache, bnum);
 }
 
