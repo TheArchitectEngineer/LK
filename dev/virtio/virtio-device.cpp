@@ -132,6 +132,12 @@ status_t virtio_device::virtio_alloc_ring(uint index, uint16_t len) {
     if (index >= MAX_VIRTIO_RINGS)
         return ERR_INVALID_ARGS;
 
+    uint16_t max = bus()->virtio_queue_max_size(index);
+    if (len > max) {
+        TRACEF("dev %p: ring %u size %u exceeds device maximum %u\n", this, index, len, max);
+        return ERR_INVALID_ARGS;
+    }
+
     vring &ring = ring_[index];
 
     /* allocate a ring */

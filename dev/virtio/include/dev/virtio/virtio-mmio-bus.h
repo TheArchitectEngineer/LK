@@ -26,6 +26,7 @@ public:
     status_t virtio_status_features_ok() override;
     void virtio_status_driver_ok() override;
     void virtio_kick(uint16_t ring_index) override;
+    uint16_t virtio_queue_max_size(uint16_t queue_sel) override;
 
     void register_ring(uint32_t page_size, uint32_t queue_sel, uint32_t queue_num, uint32_t queue_align, uint32_t queue_pfn) override;
 

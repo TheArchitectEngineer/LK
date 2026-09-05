@@ -217,6 +217,14 @@ void virtio_pci_bus::virtio_kick(uint16_t ring_index) {
     *notify = ring_index;
 }
 
+uint16_t virtio_pci_bus::virtio_queue_max_size(uint16_t queue_sel) {
+    auto *ccfg = common_config();
+
+    // queue_size reads back as the device's maximum until the driver writes it
+    ccfg->queue_select = queue_sel;
+    return ccfg->queue_size;
+}
+
 void virtio_pci_bus::register_ring(uint32_t page_size, uint32_t queue_sel, uint32_t queue_num, uint32_t queue_align, uint32_t queue_pfn) {
     auto *ccfg = common_config();
 

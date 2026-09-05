@@ -8,6 +8,8 @@
 
 #include <dev/virtio/rng.h>
 
+#include <algorithm>
+
 #include <dev/virtio/virtio-device.h>
 #include <dev/virtio/virtio_ring.h>
 #include <kernel/event.h>
@@ -82,7 +84,10 @@ status_t virtio_rng_init(virtio_device *dev) {
         return err;
     }
 
-    err = dev->virtio_alloc_ring(RNG_QUEUE_INDEX, 32);
+    /* only one request is ever outstanding, so any ring the device offers is enough.
+     * QEMU's virtio-rng has an 8 entry queue. */
+    uint16_t ring_len = std::min<uint16_t>(32, dev->bus()->virtio_queue_max_size(RNG_QUEUE_INDEX));
+    err = dev->virtio_alloc_ring(RNG_QUEUE_INDEX, ring_len);
     if (err != NO_ERROR) {
         TRACEF("virtio-rng: Failed to allocate virtqueue\n");
         return err;
