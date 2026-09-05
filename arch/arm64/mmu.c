@@ -47,10 +47,6 @@ uint64_t arm64_mmu_tcr_flags __SECTION(".bss.prebss.tcr_flags");
 static bool arm64_asids_enabled;
 static asid_allocator_t arm64_asid_allocator;
 
-static inline bool is_valid_vaddr(const arch_aspace_t *aspace, vaddr_t vaddr) {
-    return (vaddr >= aspace->base && vaddr <= aspace->base + aspace->size - 1);
-}
-
 /*
  * TLB maintenance. Every change follows the same shape: write the descriptor,
  * dsb ishst so the table walkers on every cpu see the write before the
@@ -160,8 +156,7 @@ status_t arch_mmu_query(arch_aspace_t *aspace, vaddr_t vaddr, paddr_t *paddr, ui
     DEBUG_ASSERT(aspace);
     DEBUG_ASSERT(aspace->tt_virt);
 
-    DEBUG_ASSERT(is_valid_vaddr(aspace, vaddr));
-    if (!is_valid_vaddr(aspace, vaddr)) {
+    if (!arch_mmu_range_in_aspace(aspace, vaddr, 1)) {
         return ERR_OUT_OF_RANGE;
     }
 
@@ -544,7 +539,7 @@ int arm64_mmu_map(vaddr_t vaddr, paddr_t paddr, size_t size, pte_t attrs,
     if (vaddr_rel > vaddr_rel_max - size || size > vaddr_rel_max) {
         TRACEF("vaddr 0x%lx, size 0x%lx out of range vaddr 0x%lx, size 0x%lx\n",
                vaddr, size, vaddr_base, vaddr_rel_max);
-        return ERR_INVALID_ARGS;
+        return ERR_OUT_OF_RANGE;
     }
 
     if (!top_page_table) {
@@ -578,7 +573,7 @@ int arm64_mmu_unmap(vaddr_t vaddr, size_t size,
     if (vaddr_rel > vaddr_rel_max - size || size > vaddr_rel_max) {
         TRACEF("vaddr 0x%lx, size 0x%lx out of range vaddr 0x%lx, size 0x%lx\n",
                vaddr, size, vaddr_base, vaddr_rel_max);
-        return ERR_INVALID_ARGS;
+        return ERR_OUT_OF_RANGE;
     }
 
     if (!top_page_table) {
@@ -603,8 +598,7 @@ int arch_mmu_map(arch_aspace_t *aspace, vaddr_t vaddr, paddr_t paddr, uint count
     DEBUG_ASSERT(aspace);
     DEBUG_ASSERT(aspace->tt_virt);
 
-    DEBUG_ASSERT(is_valid_vaddr(aspace, vaddr));
-    if (!is_valid_vaddr(aspace, vaddr)) {
+    if (!arch_mmu_range_in_aspace(aspace, vaddr, count)) {
         return ERR_OUT_OF_RANGE;
     }
 
@@ -649,9 +643,7 @@ int arch_mmu_unmap(arch_aspace_t *aspace, vaddr_t vaddr, uint count) {
     DEBUG_ASSERT(aspace);
     DEBUG_ASSERT(aspace->tt_virt);
 
-    DEBUG_ASSERT(is_valid_vaddr(aspace, vaddr));
-
-    if (!is_valid_vaddr(aspace, vaddr)) {
+    if (!arch_mmu_range_in_aspace(aspace, vaddr, count)) {
         return ERR_OUT_OF_RANGE;
     }
 

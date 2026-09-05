@@ -641,6 +641,10 @@ int arch_mmu_map(arch_aspace_t *aspace, vaddr_t vaddr, paddr_t paddr, uint count
         return ERR_INVALID_ARGS;
     }
 
+    if (!arch_mmu_range_in_aspace(aspace, vaddr, count)) {
+        return ERR_OUT_OF_RANGE;
+    }
+
     size_t len_minus_one = (size_t)count * PAGE_SIZE - 1;
 
     volatile root_ptp_t *root = aspace->pgtable_virt;
@@ -660,6 +664,10 @@ int arch_mmu_unmap(arch_aspace_t *aspace, vaddr_t vaddr, uint count) {
         return ERR_INVALID_ARGS;
     }
 
+    if (!arch_mmu_range_in_aspace(aspace, vaddr, count)) {
+        return ERR_OUT_OF_RANGE;
+    }
+
     size_t len_minus_one = (size_t)count * PAGE_SIZE - 1;
     volatile root_ptp_t *root = aspace->pgtable_virt;
     status_t st = unmap_range_table(root, vaddr, len_minus_one);
@@ -671,6 +679,10 @@ int arch_mmu_unmap(arch_aspace_t *aspace, vaddr_t vaddr, uint count) {
 
 status_t arch_mmu_query(arch_aspace_t *aspace, vaddr_t vaddr, paddr_t *paddr, uint *flags) {
     LTRACEF("aspace %p, vaddr %#lx\n", aspace, vaddr);
+
+    if (!arch_mmu_range_in_aspace(aspace, vaddr, 1)) {
+        return ERR_OUT_OF_RANGE;
+    }
 
     // Disable interrupts around the ptest instruction in case we get preempted
     arch_interrupt_saved_state_t state = arch_interrupt_save();

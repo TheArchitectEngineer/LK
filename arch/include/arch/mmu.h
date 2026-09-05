@@ -10,6 +10,7 @@
 #if ARCH_HAS_MMU
 
 #include <arch.h>
+#include <arch/defines.h>
 #include <lk/compiler.h>
 #include <stdbool.h>
 #include <sys/types.h>
@@ -40,6 +41,17 @@ bool arch_mmu_supports_user_aspaces(void);
 typedef struct arch_aspace arch_aspace_t;
 
 #define ARCH_ASPACE_FLAG_KERNEL         (1U<<0)
+
+/* [vaddr, vaddr + count pages) lies inside the aspace. Computed so an aspace
+ * that runs to the top of the address space does not overflow. Map, unmap and
+ * query return ERR_OUT_OF_RANGE for anything outside. */
+static inline bool arch_mmu_range_in_aspace(const arch_aspace_t *aspace, vaddr_t vaddr, uint count) {
+    if (vaddr < aspace->base || vaddr > aspace->base + aspace->size - 1) {
+        return false;
+    }
+    const size_t pages_left = (aspace->base + aspace->size - 1 - vaddr) / PAGE_SIZE + 1;
+    return count <= pages_left;
+}
 
 /* initialize per address space */
 status_t arch_mmu_init_aspace(arch_aspace_t *aspace, vaddr_t base, size_t size, uint flags) __NONNULL((1));

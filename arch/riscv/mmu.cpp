@@ -200,17 +200,6 @@ void riscv_tlb_shootdown(const arch_aspace_t *aspace, vaddr_t base, size_t count
     mp_sync_exec(MP_IPI_TARGET_ALL, 0, tlb_shootdown_task, &args);
 }
 
-// [vaddr, vaddr + count pages) lies inside the aspace
-bool range_in_aspace(const arch_aspace_t *aspace, vaddr_t vaddr, uint count) {
-    if (vaddr < aspace->base || vaddr > aspace->base + aspace->size - 1) {
-        return false;
-    }
-    // pages from vaddr to the end of the aspace, computed without overflowing
-    // when the aspace runs to the top of the address space
-    const size_t pages_left = (aspace->base + aspace->size - 1 - vaddr) / PAGE_SIZE + 1;
-    return count <= pages_left;
-}
-
 volatile riscv_pte_t *alloc_ptable(arch_aspace_t *aspace, addr_t *pa) {
     // grab a page from the pmm
     vm_page_t *p = pmm_alloc_page();
@@ -553,7 +542,7 @@ int arch_mmu_map(arch_aspace_t *aspace, const vaddr_t _vaddr, paddr_t paddr, uin
         return ERR_INVALID_ARGS;
     }
 
-    if (!range_in_aspace(aspace, _vaddr, count)) {
+    if (!arch_mmu_range_in_aspace(aspace, _vaddr, count)) {
         return ERR_OUT_OF_RANGE;
     }
 
@@ -632,7 +621,7 @@ status_t arch_mmu_query(arch_aspace_t *aspace, const vaddr_t _vaddr, paddr_t *pa
     DEBUG_ASSERT(aspace);
     DEBUG_ASSERT(aspace->magic == RISCV_ASPACE_MAGIC);
 
-    if (!range_in_aspace(aspace, _vaddr, 1)) {
+    if (!arch_mmu_range_in_aspace(aspace, _vaddr, 1)) {
         return ERR_OUT_OF_RANGE;
     }
 
@@ -683,7 +672,7 @@ int arch_mmu_unmap(arch_aspace_t *aspace, const vaddr_t _vaddr, const uint _coun
         return ERR_INVALID_ARGS;
     }
 
-    if (!range_in_aspace(aspace, _vaddr, _count)) {
+    if (!arch_mmu_range_in_aspace(aspace, _vaddr, _count)) {
         return ERR_OUT_OF_RANGE;
     }
 
