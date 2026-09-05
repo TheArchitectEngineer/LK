@@ -161,14 +161,14 @@ static inline bool iframe_from_user(const struct arm64_iframe_long *iframe) {
     return BITS_SHIFT(iframe->spsr, 3, 2) == 0;
 }
 
-__WEAK void arm64_syscall(struct arm64_iframe_long *iframe, bool is_64bit) {
+void arm64_syscall_unhandled(struct arm64_iframe_long *iframe, bool is_64bit) {
     printf("unhandled %s syscall from user space in thread %s\n",
            is_64bit ? "aarch64" : "aarch32", get_current_thread()->name);
     dump_iframe(iframe);
     thread_exit(ERR_NOT_SUPPORTED);
 }
 
-__WEAK void arm64_user_exception(struct arm64_iframe_long *iframe, uint32_t esr, uint64_t far) {
+void arm64_user_exception_unhandled(struct arm64_iframe_long *iframe, uint32_t esr, uint64_t far) {
     uint32_t ec = BITS_SHIFT(esr, 31, 26);
     uint32_t iss = BITS(esr, 24, 0);
 
@@ -179,6 +179,14 @@ __WEAK void arm64_user_exception(struct arm64_iframe_long *iframe, uint32_t esr,
     }
     dump_iframe(iframe);
     thread_exit(ERR_FAULT);
+}
+
+__WEAK void arm64_syscall(struct arm64_iframe_long *iframe, bool is_64bit) {
+    arm64_syscall_unhandled(iframe, is_64bit);
+}
+
+__WEAK void arm64_user_exception(struct arm64_iframe_long *iframe, uint32_t esr, uint64_t far) {
+    arm64_user_exception_unhandled(iframe, esr, far);
 }
 
 void arm64_sync_exception(struct arm64_iframe_long *iframe);

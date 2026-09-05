@@ -2,7 +2,10 @@ LOCAL_DIR := $(GET_LOCAL_DIR)
 
 MODULE := $(LOCAL_DIR)
 
-MODULE_SRCS := $(LOCAL_DIR)/mmu.cpp
+MODULE_SRCS := \
+	$(LOCAL_DIR)/mmu.cpp \
+	$(LOCAL_DIR)/uspace.cpp \
+	$(LOCAL_DIR)/uspace_stubs.S \
 
 # The floating point tests are compiled with floating point support. They are
 # guarded internally by #if !WITH_NO_FP (and #if ARM_WITH_VFP for the assembly),

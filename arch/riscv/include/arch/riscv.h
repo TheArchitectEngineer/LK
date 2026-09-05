@@ -251,6 +251,10 @@ enum handler_return riscv_platform_irq(void);
 void riscv_syscall_handler(struct riscv_short_iframe *frame);
 void riscv_user_exception(long cause, ulong epc, struct riscv_short_iframe *frame);
 
+// what the hooks do unless overridden; an override can fall back to these
+void riscv_syscall_unhandled(struct riscv_short_iframe *frame) __NO_RETURN;
+void riscv_user_exception_unhandled(long cause, ulong epc, struct riscv_short_iframe *frame) __NO_RETURN;
+
 // If using S mode, time seems to be implemented in clint.h
 // TODO: clean up by moving into its own header
 #if RISCV_S_MODE

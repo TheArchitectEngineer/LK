@@ -111,23 +111,31 @@ static void fatal_exception(long cause, ulong epc, struct riscv_short_iframe *fr
     platform_halt(HALT_ACTION_HALT, HALT_REASON_SW_PANIC);
 }
 
-// weak references, overridable by whatever hosts user space. Both run in
-// trap context on the thread's kernel stack with interrupts disabled;
-// returning resumes user space at frame->epc.
-__WEAK
-void riscv_syscall_handler(struct riscv_short_iframe *frame) {
+void riscv_syscall_unhandled(struct riscv_short_iframe *frame) {
     printf("unhandled syscall from user space in thread %s\n", get_current_thread()->name);
     dump_iframe(frame, false);
     thread_exit(ERR_NOT_SUPPORTED);
 }
 
-__WEAK
-void riscv_user_exception(long cause, ulong epc, struct riscv_short_iframe *frame) {
+void riscv_user_exception_unhandled(long cause, ulong epc, struct riscv_short_iframe *frame) {
     printf("unhandled exception from user space in thread %s: cause %#lx (%s), epc %#lx, tval %#lx\n",
            get_current_thread()->name, cause, cause_to_string(cause), epc,
            riscv_csr_read(RISCV_CSR_XTVAL));
     dump_iframe(frame, false);
     thread_exit(ERR_FAULT);
+}
+
+// weak references, overridable by whatever hosts user space. Both run in
+// trap context on the thread's kernel stack with interrupts disabled;
+// returning resumes user space at frame->epc.
+__WEAK
+void riscv_syscall_handler(struct riscv_short_iframe *frame) {
+    riscv_syscall_unhandled(frame);
+}
+
+__WEAK
+void riscv_user_exception(long cause, ulong epc, struct riscv_short_iframe *frame) {
+    riscv_user_exception_unhandled(cause, epc, frame);
 }
 
 // called from assembly
