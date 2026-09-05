@@ -133,14 +133,30 @@ void arch_chain_load(void *entry, ulong arg0, ulong arg1, ulong arg2, ulong arg3
     PANIC_UNIMPLEMENTED;
 }
 
-/* switch to user mode, set the user stack pointer to user_stack_top, put the svc stack pointer to the top of the kernel stack */
+#define ZERO_REG(n) "mov x" #n ", xzr;"
+
+/*
+ * Switch to user mode at entry_point with the user stack at user_stack_top.
+ * The kernel stack is left 16 bytes below its top, which is where exceptions
+ * from EL0 then land: exceptions.S reloads x18 from the word above that, so it
+ * holds this cpu's percpu pointer, and uses the word below it to spill the
+ * user's x18 on the short frames. Every return to EL0 rewrites the percpu word,
+ * as the thread may run on another cpu by then.
+ */
 void arch_enter_uspace(vaddr_t entry_point, vaddr_t user_stack_top) {
     DEBUG_ASSERT(IS_ALIGNED(user_stack_top, 16));
 
     thread_t *ct = get_current_thread();
+#if WITH_KERNEL_VM
+    DEBUG_ASSERT(ct->aspace);
+#endif
 
     vaddr_t kernel_stack_top = (uintptr_t)ct->stack + ct->stack_size;
     kernel_stack_top = ROUNDDOWN(kernel_stack_top, 16);
+
+    uint64_t *percpu_slot = (uint64_t *)(kernel_stack_top - 8);
+    *percpu_slot = (uint64_t)arm64_get_percpu();
+    vaddr_t kernel_sp = kernel_stack_top - 16;
 
     /* set up a default spsr to get into 64bit user space:
      * zeroed NZCV
@@ -157,10 +173,15 @@ void arch_enter_uspace(vaddr_t entry_point, vaddr_t user_stack_top) {
         "msr    sp_el0, %[ustack];"
         "msr    elr_el1, %[entry];"
         "msr    spsr_el1, %[spsr];"
+        /* nothing of the kernel's, the percpu pointer in x18 included, reaches user space */
+        ZERO_REG(0) ZERO_REG(1) ZERO_REG(2) ZERO_REG(3) ZERO_REG(4) ZERO_REG(5) ZERO_REG(6) ZERO_REG(7)
+        ZERO_REG(8) ZERO_REG(9) ZERO_REG(10) ZERO_REG(11) ZERO_REG(12) ZERO_REG(13) ZERO_REG(14) ZERO_REG(15)
+        ZERO_REG(16) ZERO_REG(17) ZERO_REG(18) ZERO_REG(19) ZERO_REG(20) ZERO_REG(21) ZERO_REG(22) ZERO_REG(23)
+        ZERO_REG(24) ZERO_REG(25) ZERO_REG(26) ZERO_REG(27) ZERO_REG(28) ZERO_REG(29) ZERO_REG(30)
         "eret;"
         :
         : [ustack] "r"(user_stack_top),
-          [kstack] "r"(kernel_stack_top),
+          [kstack] "r"(kernel_sp),
           [entry] "r"(entry_point),
           [spsr] "r"(spsr)
         : "memory");
