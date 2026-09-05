@@ -9,6 +9,8 @@
 
 #ifndef ASSEMBLY
 
+/* before arch/ops.h so it leaves out its empty arch_spinloop_pause() */
+#define ARCH_HAS_SPINLOOP_PAUSE 1
 #include <arch/ops.h>
 #include <stdbool.h>
 #include <lk/compiler.h>
@@ -55,6 +57,10 @@ static inline bool arch_fiqs_disabled(void) {
 #define smp_wmb()   CF
 #define smp_rmb()   CF
 #endif
+
+static inline void arch_spinloop_pause(void) {
+    __asm__ volatile("yield" ::: "memory");
+}
 
 static inline ulong arch_cycle_count(void) {
     if (!arm64_cycle_counter_enabled) {
