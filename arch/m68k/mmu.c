@@ -714,7 +714,7 @@ status_t arch_mmu_query(arch_aspace_t *aspace, vaddr_t vaddr, paddr_t *paddr, ui
     return NO_ERROR;
 }
 
-void arch_mmu_context_switch(arch_aspace_t *aspace) {
+void arch_mmu_context_switch(arch_aspace_t *old_aspace, arch_aspace_t *aspace) {
     // If unloading user space or switching to kernel, point URP at kernel root
     if (!aspace || (aspace->flags & ARCH_ASPACE_FLAG_KERNEL)) {
         set_urp((uint32_t)(uintptr_t)kernel_pgtable);

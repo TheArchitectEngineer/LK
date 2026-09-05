@@ -56,10 +56,13 @@ vaddr_t arch_mmu_pick_spot(arch_aspace_t *aspace,
                            vaddr_t align, size_t size, uint arch_mmu_flags) __NONNULL((1));
 
 /*
- * load a new user address space context.
- * aspace argument NULL should unload user space.
+ * Load a new user address space context on the current cpu.
+ * new_aspace NULL unloads user space, leaving only the kernel mapped.
+ * old_aspace is the user aspace the cpu had loaded before the call (NULL if
+ * none) and is only there for bookkeeping; the arch may ignore it.
+ * The scheduler calls this with interrupts disabled.
  */
-void arch_mmu_context_switch(arch_aspace_t *aspace);
+void arch_mmu_context_switch(arch_aspace_t *old_aspace, arch_aspace_t *new_aspace);
 
 __END_CDECLS
 

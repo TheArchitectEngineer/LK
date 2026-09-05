@@ -172,8 +172,8 @@ bool context_switch() {
         auto aspace_cleanup = lk::make_auto_call([&]() { arch_mmu_destroy_aspace(&as); });
 
         // switch to the address space
-        arch_mmu_context_switch(&as);
-        auto cleanup_switch = lk::make_auto_call([&]() { arch_mmu_context_switch(NULL); });
+        arch_mmu_context_switch(NULL, &as);
+        auto cleanup_switch = lk::make_auto_call([&]() { arch_mmu_context_switch(&as, NULL); });
 
         // map a page, verify can be read through the page
         vm_page_t *p = pmm_alloc_page();
@@ -204,7 +204,7 @@ bool context_switch() {
 
         // switch back to kernel aspace
         cleanup_switch.cancel();
-        arch_mmu_context_switch(NULL);
+        arch_mmu_context_switch(&as, NULL);
 
         // destroy it
         aspace_cleanup.cancel();

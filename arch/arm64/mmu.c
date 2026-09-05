@@ -641,7 +641,7 @@ status_t arch_mmu_destroy_aspace(arch_aspace_t *aspace) {
     return NO_ERROR;
 }
 
-void arch_mmu_context_switch(arch_aspace_t *aspace) {
+void arch_mmu_context_switch(arch_aspace_t *old_aspace, arch_aspace_t *aspace) {
     if (TRACE_CONTEXT_SWITCH) {
         TRACEF("aspace %p\n", aspace);
     }

@@ -577,7 +577,7 @@ int arch_mmu_unmap(arch_aspace_t *aspace, const vaddr_t _vaddr, const uint _coun
 
 // load a new user address space context.
 // aspace argument NULL should load kernel-only context
-void arch_mmu_context_switch(arch_aspace_t *aspace) {
+void arch_mmu_context_switch(arch_aspace_t *old_aspace, arch_aspace_t *aspace) {
     LTRACEF("aspace %p\n", aspace);
 
     DEBUG_ASSERT(!aspace || aspace->magic == RISCV_ASPACE_MAGIC);

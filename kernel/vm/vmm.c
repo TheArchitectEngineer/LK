@@ -748,7 +748,8 @@ status_t vmm_free_aspace(vmm_aspace_t *aspace) {
 void vmm_context_switch(vmm_aspace_t *oldspace, vmm_aspace_t *newaspace) {
     DEBUG_ASSERT(thread_lock_held());
 
-    arch_mmu_context_switch(newaspace ? &newaspace->arch_aspace : NULL);
+    arch_mmu_context_switch(oldspace ? &oldspace->arch_aspace : NULL,
+                            newaspace ? &newaspace->arch_aspace : NULL);
 }
 
 vmm_aspace_t* vmm_set_active_aspace(vmm_aspace_t *aspace) {
