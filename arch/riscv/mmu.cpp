@@ -19,7 +19,6 @@
 #include <arch/mmu.h>
 #include <arch/riscv.h>
 #include <arch/riscv/csr.h>
-#include <arch/riscv/sbi.h>
 #include <kernel/mp.h>
 #include <kernel/vm.h>
 #include <kernel/vm/asid.h>
@@ -145,27 +144,71 @@ void riscv_set_satp(uint asid, paddr_t pt) {
     riscv_csr_write(RISCV_CSR_SATP, satp);
 }
 
-void riscv_tlb_flush_vma_range(vaddr_t base, size_t count) {
-    if (count == 0)
+// TLB shootdown of a range of pages in one aspace, run on every cpu. Kernel
+// entries are global, so they are matched under every asid; user entries under
+// the aspace's own. A run longer than this many pages, or one that freed a page
+// table (whose cached intermediate entries a per page fence need not cover), is
+// flushed as a whole instead.
+constexpr size_t tlb_shootdown_max_pages = 16;
+
+struct tlb_shootdown_args {
+    vaddr_t base;
+    size_t count;
+    uint16_t asid;
+    bool global;
+    bool full;
+};
+
+void tlb_shootdown_task(void *arg) {
+    const auto *args = static_cast<const tlb_shootdown_args *>(arg);
+
+    if (args->full || args->count > tlb_shootdown_max_pages) {
+        if (args->global) {
+            riscv_tlb_flush_all();
+        } else {
+            riscv_tlb_flush_asid(args->asid);
+        }
         return;
+    }
 
-    // Use SBI to shoot down a range of vaddrs on all the cpus
-    ulong hart_mask = -1; // TODO: be more selective about the cpus
-    sbi_rfence_vma(&hart_mask, base, count * PAGE_SIZE);
-
-    // locally shoot down
-    // XXX: is this needed or does the sbi call do it if included in the local hart mask?
-    while (count > 0) {
-        asm volatile("sfence.vma %0, zero" :: "r"(base) : "memory");
-        base += PAGE_SIZE;
-        count--;
+    for (size_t i = 0; i < args->count; i++) {
+        const vaddr_t va = args->base + i * PAGE_SIZE;
+        if (args->global) {
+            riscv_tlb_flush_va_all_asids(va);
+        } else {
+            riscv_tlb_flush_va_asid(va, args->asid);
+        }
     }
 }
 
-void riscv_tlb_flush_global() {
-    // Use SBI to do a global TLB shoot down on all cpus
-    ulong hart_mask = -1; // TODO: be more selective about the cpus
-    sbi_rfence_vma(&hart_mask, 0, -1);
+// Make every cpu drop what it may have cached for [base, base + count pages) of
+// this aspace. Interrupts must be enabled when other cpus are up; with only this
+// cpu active, as during early boot, the fence simply runs here.
+void riscv_tlb_shootdown(const arch_aspace_t *aspace, vaddr_t base, size_t count, bool tables_freed) {
+    tlb_shootdown_args args = {
+        .base = base,
+        .count = count,
+        .asid = aspace->asid,
+        .global = (aspace->flags & ARCH_ASPACE_FLAG_KERNEL) != 0,
+        .full = tables_freed,
+    };
+
+    LTRACEF("base %#lx count %zu asid %#x global %d full %d\n", base, count, args.asid, args.global, args.full);
+
+    // the page table stores must be visible to the other harts before their fences run
+    smp_mb();
+    mp_sync_exec(MP_IPI_TARGET_ALL, 0, tlb_shootdown_task, &args);
+}
+
+// [vaddr, vaddr + count pages) lies inside the aspace
+bool range_in_aspace(const arch_aspace_t *aspace, vaddr_t vaddr, uint count) {
+    if (vaddr < aspace->base || vaddr > aspace->base + aspace->size - 1) {
+        return false;
+    }
+    // pages from vaddr to the end of the aspace, computed without overflowing
+    // when the aspace runs to the top of the address space
+    const size_t pages_left = (aspace->base + aspace->size - 1 - vaddr) / PAGE_SIZE + 1;
+    return count <= pages_left;
 }
 
 volatile riscv_pte_t *alloc_ptable(arch_aspace_t *aspace, addr_t *pa) {
@@ -297,8 +340,14 @@ status_t arch_mmu_destroy_aspace(arch_aspace_t *aspace) {
     if (aspace->flags & ARCH_ASPACE_FLAG_KERNEL) {
         panic("trying to destroy kernel aspace\n");
     } else {
-        // no cpu may still be running on these tables
+        // no cpu may still be running on these tables, and every mapping must
+        // already be gone: unmapping is what reclaims the lower tables, so only
+        // the root should be left
         DEBUG_ASSERT(__atomic_load_n(&aspace->active_cpus, __ATOMIC_RELAXED) == 0);
+        for (uint i = 0; i < kernel_start_index; i++) {
+            DEBUG_ASSERT_MSG(aspace->pt_virt[i] == 0, "user root entry %u still %#lx\n", i, aspace->pt_virt[i]);
+        }
+        DEBUG_ASSERT(list_length(&aspace->pt_list) == 1);
 
         if (riscv_use_asids) {
             // Drop whatever every cpu still holds under this asid before it can
@@ -357,18 +406,65 @@ struct walk_cb_ret {
 // in the callback arg, define a function or lambda that matches this signature
 using page_walk_cb = walk_cb_ret(*)(uint level, uint index, riscv_pte_t pte, vaddr_t *vaddr);
 
-// generic walker routine to automate drilling through a page table structure
+// the page table an entry lives in; tables are page sized and page aligned
+inline volatile riscv_pte_t *table_of(volatile riscv_pte_t *ptep) {
+    return reinterpret_cast<volatile riscv_pte_t *>(reinterpret_cast<uintptr_t>(ptep) & ~(PAGE_SIZE - 1));
+}
+
+bool table_is_empty(volatile riscv_pte_t *table) {
+    for (uint i = 0; i < RISCV_MMU_PT_ENTRIES; i++) {
+        if (table[i] != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// After the entry at ptep_at_level[level] was cleared, unlink and collect every
+// table from that level upwards that is now empty. The top level table is never
+// touched, and neither are the kernel aspace's level below it: those are the
+// static kernel_l2_pgtable pages every user root shares. The pages go on
+// freed_tables for the caller to release once no cpu can still be walking them.
+void reclaim_empty_tables(arch_aspace_t *aspace, volatile riscv_pte_t *const ptep_at_level[],
+                          uint level, struct list_node *freed_tables) {
+    const uint top = RISCV_MMU_PT_LEVELS - 1;
+    const uint highest = (aspace->flags & ARCH_ASPACE_FLAG_KERNEL) ? top - 2 : top - 1;
+
+    for (uint l = level; l <= highest; l++) {
+        volatile riscv_pte_t *table = table_of(ptep_at_level[l]);
+        if (!table_is_empty(table)) {
+            break;
+        }
+
+        LTRACEF_LEVEL(2, "level %u table %p empty, unlinking from %p\n", l, table, ptep_at_level[l + 1]);
+        *ptep_at_level[l + 1] = 0;
+
+        vm_page_t *page = paddr_to_vm_page(vaddr_to_paddr(const_cast<riscv_pte_t *>(table)));
+        DEBUG_ASSERT(page);
+        DEBUG_ASSERT(list_in_list(&page->node));
+        list_delete(&page->node);
+        list_add_tail(freed_tables, &page->node);
+    }
+}
+
+// generic walker routine to automate drilling through a page table structure.
+// Tables emptied by an unmap are unlinked and collected on freed_tables when
+// one is given; the caller frees them after the TLB shootdown.
 template <typename F>
-int riscv_pt_walk(arch_aspace_t *aspace, vaddr_t vaddr, F callback) {
+int riscv_pt_walk(arch_aspace_t *aspace, vaddr_t vaddr, F callback, struct list_node *freed_tables) {
     LTRACEF("vaddr %#lx\n", vaddr);
 
     DEBUG_ASSERT(aspace);
+
+    // the entry walked through at each level of the current walk
+    volatile riscv_pte_t *ptep_at_level[RISCV_MMU_PT_LEVELS];
 
 restart:
     // bootstrap the top level walk
     uint level = RISCV_MMU_PT_LEVELS - 1;
     uint index = vaddr_to_index(vaddr, level);
     volatile riscv_pte_t *ptep = aspace->pt_virt + index;
+    ptep_at_level[level] = ptep;
 
     for (;;) {
         LTRACEF_LEVEL(2, "level %u, index %u, pte %p (%#lx) va %#lx\n",
@@ -387,6 +483,7 @@ restart:
             level--;
             index = vaddr_to_index(vaddr, level);
             ptep = ptv + index;
+            ptep_at_level[level] = ptep;
         } else {
             // it's a non valid page entry or a valid terminal entry
             // call the callback, seeing what the user wants
@@ -398,8 +495,8 @@ restart:
                     if (ret.commit) {
                         // commit the change
                         *ptep = ret.new_pte;
-                        if (ret.unmap) {
-                            // TODO: this was an unmap, test to see if we have emptied a page table
+                        if (ret.unmap && freed_tables) {
+                            reclaim_empty_tables(aspace, ptep_at_level, level, freed_tables);
                         }
                     }
 
@@ -428,6 +525,7 @@ restart:
                     level--;
                     index = vaddr_to_index(vaddr, level);
                     ptep = ptv + index;
+                    ptep_at_level[level] = ptep;
                     break;
             }
         }
@@ -451,11 +549,13 @@ int arch_mmu_map(arch_aspace_t *aspace, const vaddr_t _vaddr, paddr_t paddr, uin
         return ERR_INVALID_ARGS;
     }
 
-    // trim the vaddr to the aspace
-    if (_vaddr < aspace->base || _vaddr > aspace->base + aspace->size - 1) {
+    if (!IS_PAGE_ALIGNED(_vaddr) || !IS_PAGE_ALIGNED(paddr)) {
+        return ERR_INVALID_ARGS;
+    }
+
+    if (!range_in_aspace(aspace, _vaddr, count)) {
         return ERR_OUT_OF_RANGE;
     }
-    // TODO: make sure _vaddr + count * PAGE_SIZE is within the address space
 
     if (count == 0) {
         return NO_ERROR;
@@ -469,17 +569,9 @@ int arch_mmu_map(arch_aspace_t *aspace, const vaddr_t _vaddr, paddr_t paddr, uin
                 level, index, pte, *vaddr, paddr, count, flags);
 
         if ((pte & RISCV_PTE_V)) {
-            // we have hit a valid pte of some kind
-            // assert that it's not a page table pointer, which we shouldn't be hitting in the callback
+            // a valid terminal entry, a page or a large page, already covers this address
             DEBUG_ASSERT(pte & RISCV_PTE_PERM_MASK);
-
-            // for now, panic
-            if (level > 0) {
-                PANIC_UNIMPLEMENTED_MSG("terminal large page entry");
-            } else {
-                PANIC_UNIMPLEMENTED_MSG("terminal page entry");
-            }
-
+            TRACEF("mapping already exists at %#lx (level %u pte %#lx)\n", *vaddr, level, pte);
             return walk_cb_ret::OpHalt(ERR_ALREADY_EXISTS);
         }
 
@@ -513,7 +605,25 @@ int arch_mmu_map(arch_aspace_t *aspace, const vaddr_t _vaddr, paddr_t paddr, uin
         }
     };
 
-    return riscv_pt_walk(aspace, _vaddr, map_cb);
+    const uint total = count;
+    int ret = riscv_pt_walk(aspace, _vaddr, map_cb, nullptr);
+    const uint mapped = total - count;
+
+    if (ret < 0) {
+        // leave nothing behind from a partial mapping
+        if (mapped > 0) {
+            arch_mmu_unmap(aspace, _vaddr, mapped);
+        }
+        return ret;
+    }
+
+    // A cpu may hold a cached translation for a page that was invalid when it
+    // last looked, so the new entries need a fence before they are usable.
+    // Every cpu gets one: a stale cached entry elsewhere would fault, and there
+    // is no fault handler to fence and retry. Svvptc cpus would not need this.
+    riscv_tlb_shootdown(aspace, _vaddr, mapped, false);
+
+    return NO_ERROR;
 }
 
 status_t arch_mmu_query(arch_aspace_t *aspace, const vaddr_t _vaddr, paddr_t *paddr, uint *flags) {
@@ -522,8 +632,7 @@ status_t arch_mmu_query(arch_aspace_t *aspace, const vaddr_t _vaddr, paddr_t *pa
     DEBUG_ASSERT(aspace);
     DEBUG_ASSERT(aspace->magic == RISCV_ASPACE_MAGIC);
 
-    // trim the vaddr to the aspace
-    if (_vaddr < aspace->base || _vaddr > aspace->base + aspace->size - 1) {
+    if (!range_in_aspace(aspace, _vaddr, 1)) {
         return ERR_OUT_OF_RANGE;
     }
 
@@ -561,7 +670,7 @@ status_t arch_mmu_query(arch_aspace_t *aspace, const vaddr_t _vaddr, paddr_t *pa
         }
     };
 
-    return riscv_pt_walk(aspace, _vaddr, query_cb);
+    return riscv_pt_walk(aspace, _vaddr, query_cb, nullptr);
 }
 
 int arch_mmu_unmap(arch_aspace_t *aspace, const vaddr_t _vaddr, const uint _count) {
@@ -570,18 +679,21 @@ int arch_mmu_unmap(arch_aspace_t *aspace, const vaddr_t _vaddr, const uint _coun
     DEBUG_ASSERT(aspace);
     DEBUG_ASSERT(aspace->magic == RISCV_ASPACE_MAGIC);
 
+    if (!IS_PAGE_ALIGNED(_vaddr)) {
+        return ERR_INVALID_ARGS;
+    }
+
+    if (!range_in_aspace(aspace, _vaddr, _count)) {
+        return ERR_OUT_OF_RANGE;
+    }
+
     if (_count == 0) {
         return NO_ERROR;
     }
-    // trim the vaddr to the aspace
-    if (_vaddr < aspace->base || _vaddr > aspace->base + aspace->size - 1) {
-        return ERR_OUT_OF_RANGE;
-    }
-    // TODO: make sure _vaddr + count * PAGE_SIZE is within the address space
 
     // construct a local callback for the walker routine that
     // a) if it hits a terminal 4K entry write zeros to it
-    // b) if it hits an empty spot continue
+    // b) if it hits an empty spot skips past it
     auto count = _count;
     auto unmap_cb = [&count]
         (uint level, uint index, riscv_pte_t pte, vaddr_t *vaddr) -> walk_cb_ret {
@@ -593,12 +705,13 @@ int arch_mmu_unmap(arch_aspace_t *aspace, const vaddr_t _vaddr, const uint _coun
             DEBUG_ASSERT(pte & RISCV_PTE_PERM_MASK);
 
             if (level > 0) {
-                PANIC_UNIMPLEMENTED_MSG("cannot handle unmapping of large page");
+                // splitting a large page needs a new table in its place; refuse
+                // before touching anything. What preceded it is already unmapped.
+                TRACEF("partial unmap of large page at %#lx (level %u) not supported\n", *vaddr, level);
+                return walk_cb_ret::OpHalt(ERR_NOT_SUPPORTED);
             }
 
-            // zero it out, which should unmap the page
-            // TODO: handle freeing upper level page tables
-            // make sure we dont free kernel 2nd level pts
+            // clear the entry; the walker reclaims any table this empties
             *vaddr += PAGE_SIZE;
             count--;
             if (count == 0) {
@@ -607,9 +720,12 @@ int arch_mmu_unmap(arch_aspace_t *aspace, const vaddr_t _vaddr, const uint _coun
                 return walk_cb_ret::OpCommitRestart(0, true);
             }
         } else {
-            // nothing here so skip forward and try the next page
-            *vaddr += PAGE_SIZE;
-            count--;
+            // nothing mapped here: skip to the end of whatever this entry covers,
+            // or the end of the range, whichever comes first
+            const vaddr_t block_end = (*vaddr | page_mask_per_level(level)) + 1;
+            const size_t skip = MIN((size_t)count, (block_end - *vaddr) / PAGE_SIZE);
+            *vaddr += skip * PAGE_SIZE;
+            count -= skip;
             if (count == 0) {
                 return walk_cb_ret::OpHalt(NO_ERROR);
             } else {
@@ -618,10 +734,20 @@ int arch_mmu_unmap(arch_aspace_t *aspace, const vaddr_t _vaddr, const uint _coun
         }
     };
 
-    int ret = riscv_pt_walk(aspace, _vaddr, unmap_cb);
+    struct list_node freed_tables = LIST_INITIAL_VALUE(freed_tables);
+    int ret = riscv_pt_walk(aspace, _vaddr, unmap_cb, &freed_tables);
 
-    // TLB shootdown the range we've unmapped
-    riscv_tlb_flush_vma_range(_vaddr, _count);
+    // Shoot down the pages that were actually cleared, then and only then hand
+    // back any tables that emptied: a cpu may still be walking them until its
+    // fence has run.
+    const uint unmapped = _count - count;
+    if (unmapped > 0 || !list_is_empty(&freed_tables)) {
+        riscv_tlb_shootdown(aspace, _vaddr, unmapped, !list_is_empty(&freed_tables));
+    }
+    if (!list_is_empty(&freed_tables)) {
+        LTRACEF("freeing %zu emptied page tables\n", list_length(&freed_tables));
+        pmm_free(&freed_tables);
+    }
 
     return ret;
 }
