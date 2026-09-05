@@ -113,6 +113,9 @@ void arch_init(void) {
     arm64_mp_init();
 
     dprintf(INFO, "ARM64: boot EL%llu\n", arm64_get_boot_el());
+    dprintf(INFO, "ARM64: %s\n", (arm64_mmu_tcr_flags & MMU_TCR_AS)
+            ? "16 bit asids, one per user aspace"
+            : "8 bit asids, user aspaces share one and flush on switch");
 }
 
 uint64_t arm64_get_boot_el(void) {

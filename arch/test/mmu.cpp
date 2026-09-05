@@ -74,7 +74,11 @@ bool map_user_pages() {
             //unittest_printf("\npa %#lx, flags %#x", pa, flags);
         }
 
-        // destroy the aspace with the pages mapped
+        // unmap them again, which also frees the tables they needed
+        err = arch_mmu_unmap(&as, USER_ASPACE_BASE, count);
+        EXPECT_LE(NO_ERROR, err, "unmap");
+
+        // destroy the now empty aspace
         aspace_cleanup.cancel();
         err = arch_mmu_destroy_aspace(&as);
         EXPECT_EQ(NO_ERROR, err, "destroy");
@@ -205,6 +209,10 @@ bool context_switch() {
         // switch back to kernel aspace
         cleanup_switch.cancel();
         arch_mmu_context_switch(&as, NULL);
+
+        // unmap the page so the aspace is empty
+        err = arch_mmu_unmap(&as, USER_ASPACE_BASE, 1);
+        EXPECT_LE(NO_ERROR, err, "unmap");
 
         // destroy it
         aspace_cleanup.cancel();
