@@ -8,6 +8,7 @@
 #include <assert.h>
 #include <lk/backtrace.h>
 #include <lk/compiler.h>
+#include <lk/err.h>
 #include <lk/trace.h>
 #include <arch/riscv.h>
 #include <kernel/thread.h>
@@ -110,12 +111,23 @@ static void fatal_exception(long cause, ulong epc, struct riscv_short_iframe *fr
     platform_halt(HALT_ACTION_HALT, HALT_REASON_SW_PANIC);
 }
 
-// weak reference, can override this somewhere else
+// weak references, overridable by whatever hosts user space. Both run in
+// trap context on the thread's kernel stack with interrupts disabled;
+// returning resumes user space at frame->epc.
 __WEAK
 void riscv_syscall_handler(struct riscv_short_iframe *frame) {
-    printf("unhandled syscall handler\n");
+    printf("unhandled syscall from user space in thread %s\n", get_current_thread()->name);
     dump_iframe(frame, false);
-    platform_halt(HALT_ACTION_HALT, HALT_REASON_SW_PANIC);
+    thread_exit(ERR_NOT_SUPPORTED);
+}
+
+__WEAK
+void riscv_user_exception(long cause, ulong epc, struct riscv_short_iframe *frame) {
+    printf("unhandled exception from user space in thread %s: cause %#lx (%s), epc %#lx, tval %#lx\n",
+           get_current_thread()->name, cause, cause_to_string(cause), epc,
+           riscv_csr_read(RISCV_CSR_XTVAL));
+    dump_iframe(frame, false);
+    thread_exit(ERR_FAULT);
 }
 
 // called from assembly
@@ -147,10 +159,18 @@ void riscv_exception_handler(long cause, ulong epc, struct riscv_short_iframe *f
         // all synchronous traps go here
         switch (cause) {
             case RISCV_EXCEPTION_ENV_CALL_U_MODE: // ecall from user mode
+                // resume past the ecall, which is always 4 bytes even with the C
+                // extension; the handler may still move epc elsewhere
+                frame->epc += 4;
                 riscv_syscall_handler(frame);
                 break;
             default:
-                fatal_exception(cause, epc, frame, kernel);
+                // anything else user space did is its own problem, not the kernel's
+                if (!kernel) {
+                    riscv_user_exception(cause, epc, frame);
+                } else {
+                    fatal_exception(cause, epc, frame, kernel);
+                }
         }
     }
 
