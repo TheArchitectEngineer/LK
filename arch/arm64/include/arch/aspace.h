@@ -32,5 +32,9 @@ struct arch_aspace {
     volatile int active_cpus;
 };
 
+static inline int arch_aspace_active_cpus(const struct arch_aspace *aspace) {
+    return __atomic_load_n(&aspace->active_cpus, __ATOMIC_RELAXED);
+}
+
 __END_CDECLS
 

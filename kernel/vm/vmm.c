@@ -672,6 +672,10 @@ status_t vmm_create_aspace(vmm_aspace_t **_aspace, const char *name, uint flags)
         aspace->base = KERNEL_ASPACE_BASE;
         aspace->size = KERNEL_ASPACE_SIZE;
     } else {
+        if (!arch_mmu_supports_user_aspaces()) {
+            free(aspace);
+            return ERR_NOT_SUPPORTED;
+        }
         aspace->base = USER_ASPACE_BASE;
         aspace->size = USER_ASPACE_SIZE;
     }
@@ -697,6 +701,23 @@ status_t vmm_create_aspace(vmm_aspace_t **_aspace, const char *name, uint flags)
 }
 
 status_t vmm_free_aspace(vmm_aspace_t *aspace) {
+    /* make sure the current thread does not map the aspace */
+    thread_t *current_thread = get_current_thread();
+    if (current_thread->aspace == aspace) {
+        THREAD_LOCK(state);
+        current_thread->aspace = NULL;
+        vmm_context_switch(aspace, NULL);
+        THREAD_UNLOCK(state);
+    }
+
+    /* Another cpu still running on it would be left walking tables that are
+     * about to be freed; whoever holds it has to switch away first. A thread
+     * that merely references it but is not running is fine: its cpu unloaded
+     * the aspace when it switched away. */
+    if (arch_aspace_active_cpus(&aspace->arch_aspace) != 0) {
+        return ERR_BUSY;
+    }
+
     /* pop it out of the global aspace list */
     mutex_acquire(&vmm_lock);
     if (!list_in_list(&aspace->node)) {
@@ -725,15 +746,6 @@ status_t vmm_free_aspace(vmm_aspace_t *aspace) {
 
         /* free it */
         free(r);
-    }
-
-    /* make sure the current thread does not map the aspace */
-    thread_t *current_thread = get_current_thread();
-    if (current_thread->aspace == aspace) {
-        THREAD_LOCK(state);
-        current_thread->aspace = NULL;
-        vmm_context_switch(aspace, NULL);
-        THREAD_UNLOCK(state);
     }
 
     /* destroy the arch portion of the aspace */

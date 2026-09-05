@@ -14,6 +14,10 @@
 #include <lk/err.h>
 #include <lktl/auto_call.h>
 #include <lib/unittest.h>
+#include <arch/ops.h>
+#include <kernel/event.h>
+#include <kernel/mp.h>
+#include <kernel/thread.h>
 #include <kernel/vm.h>
 
 namespace {
@@ -228,11 +232,88 @@ bool context_switch() {
     END_TEST;
 }
 
+// Holds an aspace loaded on its (pinned) cpu until told to let go. It spins
+// rather than blocks: a blocked thread is switched out, and the switch unloads
+// the aspace from the cpu, which is exactly the state this test must avoid.
+struct busy_aspace_args {
+    vmm_aspace_t *aspace;
+    event_t loaded;
+    volatile int release;
+};
+
+static int busy_aspace_thread(void *arg) {
+    auto *args = static_cast<busy_aspace_args *>(arg);
+
+    vmm_set_active_aspace(args->aspace);
+    event_signal(&args->loaded, true);
+    while (!__atomic_load_n(&args->release, __ATOMIC_ACQUIRE)) {
+        arch_spinloop_pause();
+    }
+    vmm_set_active_aspace(nullptr);
+    return 0;
+}
+
+bool free_active_aspace() {
+    BEGIN_TEST;
+
+    if (!arch_mmu_supports_user_aspaces()) {
+        END_TEST;
+    }
+
+    // freeing an aspace the current thread has loaded switches it off first and succeeds
+    vmm_aspace_t *as = nullptr;
+    ASSERT_EQ(NO_ERROR, vmm_create_aspace(&as, "free_active", 0), "create");
+    vmm_set_active_aspace(as);
+    EXPECT_EQ(NO_ERROR, vmm_free_aspace(as), "free while active on this cpu");
+    EXPECT_NULL(get_current_thread()->aspace, "switched off");
+
+    // with another cpu holding it, the free is refused until that cpu lets go.
+    // Pin ourselves so we cannot land on the cpu holding it and unload it by
+    // being scheduled there.
+    thread_t *self = get_current_thread();
+    thread_set_pinned_cpu(self, arch_curr_cpu_num());
+    thread_yield();
+    const uint my_cpu = arch_curr_cpu_num();
+    const mp_cpu_mask_t others = mp_get_active_mask() & ~(1U << my_cpu);
+    if (others != 0) {
+        const uint cpu = __builtin_ctz(others);
+
+        busy_aspace_args args = {};
+        ASSERT_EQ(NO_ERROR, vmm_create_aspace(&args.aspace, "free_busy", 0), "create");
+        event_init(&args.loaded, false, 0);
+
+        thread_t *t = thread_create("busy_aspace", busy_aspace_thread, &args,
+                                    DEFAULT_PRIORITY, DEFAULT_STACK_SIZE);
+        ASSERT_NONNULL(t, "thread_create");
+        thread_set_pinned_cpu(t, cpu);
+        thread_resume(t);
+        ASSERT_EQ(NO_ERROR, event_wait_timeout(&args.loaded, 5000), "aspace loaded on other cpu");
+
+        // only an arch that counts loaded cpus can refuse; the others report 0
+        if (arch_aspace_active_cpus(&args.aspace->arch_aspace) > 0) {
+            EXPECT_EQ(ERR_BUSY, vmm_free_aspace(args.aspace), "free while loaded elsewhere");
+        } else {
+            unittest_printf(" (arch does not track loaded cpus)");
+        }
+
+        __atomic_store_n(&args.release, 1, __ATOMIC_RELEASE);
+        int retcode = -1;
+        EXPECT_EQ(NO_ERROR, thread_join(t, &retcode, 5000), "join");
+        EXPECT_EQ(0, retcode, "thread return");
+
+        EXPECT_EQ(NO_ERROR, vmm_free_aspace(args.aspace), "free after release");
+    }
+    thread_set_pinned_cpu(self, -1);
+
+    END_TEST;
+}
+
 BEGIN_TEST_CASE(arch_mmu_tests)
 RUN_TEST(create_user_aspace);
 RUN_TEST(map_user_pages);
 RUN_TEST(map_query_pages);
 RUN_TEST(context_switch);
+RUN_TEST(free_active_aspace);
 END_TEST_CASE(arch_mmu_tests)
 
 } // namespace

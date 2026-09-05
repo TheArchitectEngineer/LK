@@ -64,6 +64,13 @@ vaddr_t arch_mmu_pick_spot(arch_aspace_t *aspace,
  */
 void arch_mmu_context_switch(arch_aspace_t *old_aspace, arch_aspace_t *new_aspace);
 
+/*
+ * Each arch/aspace.h also defines
+ *   static inline int arch_aspace_active_cpus(const struct arch_aspace *aspace);
+ * returning how many cpus currently have the user aspace loaded, as counted by
+ * arch_mmu_context_switch(). An arch that does not keep the count returns 0.
+ */
+
 __END_CDECLS
 
 #endif
