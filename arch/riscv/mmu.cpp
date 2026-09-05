@@ -14,12 +14,15 @@
 #include <lk/debug.h>
 #include <lk/err.h>
 #include <lk/trace.h>
+#include <arch/atomic.h>
 #include <arch/ops.h>
 #include <arch/mmu.h>
 #include <arch/riscv.h>
 #include <arch/riscv/csr.h>
 #include <arch/riscv/sbi.h>
+#include <kernel/mp.h>
 #include <kernel/vm.h>
+#include <kernel/vm/asid.h>
 
 #include "riscv_priv.h"
 
@@ -69,6 +72,25 @@ namespace {
 ulong riscv_asid_mask;
 arch_aspace_t *kernel_aspace;
 
+// User aspaces each get their own asid when the cpu implements all 16 bits of
+// the satp field, so their TLB entries survive context switches. With fewer
+// bits everything runs on asid 0 and each switch flushes the non-global entries
+// on the local cpu. Decided once the asid width has been probed in
+// riscv_early_mmu_init().
+bool riscv_use_asids;
+asid_allocator_t riscv_asid_allocator;
+
+// the asid the kernel aspace runs under: ASID_KERNEL when asids are in use,
+// else 0 like everyone else, which fits a cpu with no asid bits at all
+uint16_t kernel_asid() {
+    return riscv_use_asids ? ASID_KERNEL : 0;
+}
+
+// flush one asid on every cpu, from interrupt context on the remote ones
+void flush_asid_task(void *arg) {
+    riscv_tlb_flush_asid(*static_cast<const uint16_t *>(arg));
+}
+
 // given a va address and the level, compute the index in the current PT
 constexpr uint vaddr_to_index(vaddr_t va, uint level) {
     // levels count down from PT_LEVELS - 1
@@ -101,6 +123,8 @@ constexpr uint kernel_end_index = vaddr_to_index(KERNEL_ASPACE_BASE + KERNEL_ASP
 static_assert(kernel_end_index >= kernel_start_index && kernel_end_index < RISCV_MMU_PT_ENTRIES, "");
 static_assert(kernel_end_index - kernel_start_index + 1 == RISCV_MMU_KERNEL_PT_ENTRIES, "");
 
+// point this cpu's translation at a root table under an asid. Callers decide
+// what, if anything, to flush around it.
 void riscv_set_satp(uint asid, paddr_t pt) {
     ulong satp;
 
@@ -119,9 +143,6 @@ void riscv_set_satp(uint asid, paddr_t pt) {
     satp |= pt >> PAGE_SIZE_SHIFT;
 
     riscv_csr_write(RISCV_CSR_SATP, satp);
-
-    // TODO: TLB flush here or use asid properly
-    asm volatile("sfence.vma zero, zero" ::: "memory");
 }
 
 void riscv_tlb_flush_vma_range(vaddr_t base, size_t count) {
@@ -206,6 +227,7 @@ status_t arch_mmu_init_aspace(arch_aspace_t *aspace, vaddr_t base, size_t size, 
 
     aspace->magic = RISCV_ASPACE_MAGIC;
     aspace->flags = flags;
+    aspace->active_cpus = 0;
     list_initialize(&aspace->pt_list);
     if (flags & ARCH_ASPACE_FLAG_KERNEL) {
         // kernel aspace is special and should be constructed once
@@ -217,7 +239,11 @@ status_t arch_mmu_init_aspace(arch_aspace_t *aspace, vaddr_t base, size_t size, 
         aspace->size = size;
         aspace->pt_virt = kernel_pgtable;
         aspace->pt_phys = kernel_pgtable_phys;
+        aspace->asid = kernel_asid();
         kernel_aspace = aspace;
+
+        // the kernel aspace comes first, before any user aspace can ask for an asid
+        asid_allocator_init(&riscv_asid_allocator, RISCV_SATP_ASID_MASK);
 
         // TODO: allocate and attach kernel page tables here instead of prealloced
     } else {
@@ -225,13 +251,27 @@ status_t arch_mmu_init_aspace(arch_aspace_t *aspace, vaddr_t base, size_t size, 
         // cover the predefined range
         DEBUG_ASSERT(base == USER_ASPACE_BASE);
         DEBUG_ASSERT(size == USER_ASPACE_SIZE);
+        DEBUG_ASSERT(kernel_aspace);
 
         aspace->base = base;
         aspace->size = size;
 
+        if (riscv_use_asids) {
+            status_t err = asid_alloc(&riscv_asid_allocator, &aspace->asid);
+            if (err < 0) {
+                aspace->magic = 0;
+                return err;
+            }
+        } else {
+            aspace->asid = 0;
+        }
+
         // allocate a top level page table
         aspace->pt_virt = alloc_ptable(aspace, &aspace->pt_phys);
         if (!aspace->pt_virt) {
+            if (riscv_use_asids) {
+                asid_free(&riscv_asid_allocator, aspace->asid);
+            }
             aspace->magic = 0; // not a properly constructed aspace
             return ERR_NO_MEMORY;
         }
@@ -243,7 +283,7 @@ status_t arch_mmu_init_aspace(arch_aspace_t *aspace, vaddr_t base, size_t size, 
         smp_wmb();
     }
 
-    LTRACEF("pt phys %#lx, pt virt %p\n", aspace->pt_phys, aspace->pt_virt);
+    LTRACEF("pt phys %#lx, pt virt %p, asid %#x\n", aspace->pt_phys, aspace->pt_virt, aspace->asid);
 
     return NO_ERROR;
 }
@@ -257,8 +297,19 @@ status_t arch_mmu_destroy_aspace(arch_aspace_t *aspace) {
     if (aspace->flags & ARCH_ASPACE_FLAG_KERNEL) {
         panic("trying to destroy kernel aspace\n");
     } else {
-        // TODO: assert that it's not active
-        // TODO: shoot down the ASID
+        // no cpu may still be running on these tables
+        DEBUG_ASSERT(__atomic_load_n(&aspace->active_cpus, __ATOMIC_RELAXED) == 0);
+
+        if (riscv_use_asids) {
+            // Drop whatever every cpu still holds under this asid before it can
+            // be handed to another aspace. Without per aspace asids nothing is
+            // needed: every switch flushes asid 0 on the cpu doing it, and no cpu
+            // has this aspace loaded any more.
+            uint16_t asid = aspace->asid;
+            mp_sync_exec(MP_IPI_TARGET_ALL, 0, flush_asid_task, &asid);
+            asid_free(&riscv_asid_allocator, asid);
+        }
+        aspace->asid = 0;
 
         // mass free all of the page tables in the aspace
         DEBUG_ASSERT(!list_is_empty(&aspace->pt_list)); // should be at least one page
@@ -578,19 +629,34 @@ int arch_mmu_unmap(arch_aspace_t *aspace, const vaddr_t _vaddr, const uint _coun
 // load a new user address space context.
 // aspace argument NULL should load kernel-only context
 void arch_mmu_context_switch(arch_aspace_t *old_aspace, arch_aspace_t *aspace) {
-    LTRACEF("aspace %p\n", aspace);
+    LTRACEF("old aspace %p, aspace %p\n", old_aspace, aspace);
 
+    DEBUG_ASSERT(!old_aspace || old_aspace->magic == RISCV_ASPACE_MAGIC);
     DEBUG_ASSERT(!aspace || aspace->magic == RISCV_ASPACE_MAGIC);
 
-    if (!aspace) {
-        // switch to the kernel address space
-        riscv_set_satp(0, kernel_aspace->pt_phys);
+    if (aspace) {
+        DEBUG_ASSERT((aspace->flags & ARCH_ASPACE_FLAG_KERNEL) == 0);
+        riscv_set_satp(aspace->asid, aspace->pt_phys);
     } else {
-        riscv_set_satp(0, aspace->pt_phys);
+        // kernel only: the kernel root has no user half
+        riscv_set_satp(kernel_asid(), kernel_aspace->pt_phys);
     }
 
-    // TODO: deal with TLB flushes.
-    // for now, riscv_set_satp() does a full local TLB dump
+    // Every user aspace shares asid 0 when asids are not in use, so the
+    // outgoing aspace's entries must not survive the switch. Global kernel
+    // entries are untouched by the asid form.
+    if (!riscv_use_asids && old_aspace != aspace) {
+        riscv_tlb_flush_asid(0);
+    }
+
+    if (old_aspace) {
+        __UNUSED int prev = atomic_add(&old_aspace->active_cpus, -1);
+        DEBUG_ASSERT(prev > 0);
+    }
+    if (aspace) {
+        __UNUSED int prev = atomic_add(&aspace->active_cpus, 1);
+        DEBUG_ASSERT(prev < SMP_MAX_CPUS);
+    }
 }
 
 bool arch_mmu_supports_nx_mappings(void) { return true; }
@@ -599,8 +665,10 @@ bool arch_mmu_supports_user_aspaces(void) { return true; }
 
 extern "C"
 void riscv_mmu_init_secondaries() {
-    // switch to the proper kernel pgtable, with the trampoline parts unmapped
-    riscv_set_satp(0, kernel_pgtable_phys);
+    // switch to the proper kernel pgtable, with the trampoline parts unmapped.
+    // The trampoline's identity map is global, so everything must go.
+    riscv_set_satp(kernel_asid(), kernel_pgtable_phys);
+    riscv_tlb_flush_all();
 
     // set the SUM bit so we can access user space directly (for now)
     riscv_csr_set(RISCV_CSR_XSTATUS, RISCV_CSR_XSTATUS_SUM);
@@ -616,6 +684,9 @@ void riscv_early_mmu_init() {
     riscv_csr_write(satp, satp);
     riscv_asid_mask = (riscv_csr_read(satp) >> RISCV_SATP_ASID_SHIFT) & RISCV_SATP_ASID_MASK;
     riscv_csr_write(satp, satp_orig);
+
+    // only a full width field is worth allocating from
+    riscv_use_asids = !RISCV_ASID_FALLBACK && (riscv_asid_mask == RISCV_SATP_ASID_MASK);
 
     // install zeroed page tables to the unused portions of the kernel page tables
     for (auto i = kernel_start_index; i <= kernel_end_index; i++) {
@@ -637,7 +708,8 @@ void riscv_early_mmu_init() {
 // called a bit later once on the boot cpu
 extern "C"
 void riscv_mmu_init() {
-    dprintf(INFO, "RISCV: MMU ASID mask %#lx\n", riscv_asid_mask);
+    dprintf(INFO, "RISCV: MMU ASID mask %#lx, %s\n", riscv_asid_mask,
+            riscv_use_asids ? "one asid per user aspace" : "user aspaces share asid 0 and flush on switch");
 }
 
 #endif
