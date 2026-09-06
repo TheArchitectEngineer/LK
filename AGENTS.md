@@ -1,6 +1,6 @@
 # LK Kernel Development Guide
 
-LK is a small, SMP-aware embedded OS kernel designed for supervisor mode on diverse 32/64-bit architectures. It's used extensively in embedded systems, including Android bootloaders. Written primarily in C and assembly, with a limited C++ subset: `lib/libcpp` provides a curated portion of the C++17 standard library (see `lib/libcpp/include/` for the authoritative list), built with no exceptions, no RTTI, and no dynamic containers. `lib/lktl` is LK's own header-only C++ library (namespace `lk`: the intrusive list, `auto_call`); `lk/cpp.h` holds the `DISALLOW_*` macros.
+LK is a small, SMP-aware embedded OS kernel designed for supervisor mode on diverse 32/64-bit architectures. It's used extensively in embedded systems, including Android bootloaders. Written primarily in C and assembly, with a limited C++ subset: `lib/libcpp` provides a curated portion of the C++17 standard library (see `lib/libcpp/include/` for the authoritative list), built with no exceptions, no RTTI, and no dynamic containers. `lib/lktl` is LK's own header-only C++ library (namespace `lk`: the intrusive list, `auto_call`, `function`, `function_ref`); `lk/cpp.h` holds the `DISALLOW_*` macros.
 
 ## Architecture Overview
 
@@ -374,6 +374,14 @@ derive from `lk::list_hook<>` and use `lk::list<T>` / `lk::list_view<T>` from `l
 (module `lib/lktl`) instead of embedding a node: `containerof()` is `offsetof()`, which is
 undefined for a non-standard-layout class (virtuals, mixed access). `LK_LIST_MEMBER_TRAITS`
 covers C structs. See `docs/list.md`.
+
+#### Callbacks in C++
+
+`lk::function_ref<R(Args...)>` (`lktl/function_ref.h`) is the parameter type for a callback the
+callee only uses before it returns; it borrows the callable, two words, no size limit.
+`lk::function<R(Args...)>` (`lktl/function.h`) owns its callable inline, two words by default, for
+a callback that is stored; never store a `function_ref`. Neither touches the heap. A small loop in
+the same translation unit stays smaller as a template than through either.
 
 #### Registering Console Commands
 

@@ -4,6 +4,7 @@ MODULE := $(LOCAL_DIR)
 
 MODULE_SRCS += \
 	$(LOCAL_DIR)/auto_call_tests.cpp \
+	$(LOCAL_DIR)/function_tests.cpp \
 	$(LOCAL_DIR)/list_c_interop.c \
 	$(LOCAL_DIR)/list_tests.cpp \
 
