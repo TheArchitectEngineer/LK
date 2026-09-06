@@ -187,6 +187,14 @@ void virtio_mmio_bus::virtio_kick(uint16_t ring_index) {
     virtio_mmio_write32(&mmio_config_->queue_notify, ring_index);
 }
 
+uint16_t virtio_mmio_bus::virtio_queue_max_size(uint16_t queue_sel) {
+    DEBUG_ASSERT(mmio_config_);
+
+    virtio_mmio_write32(&mmio_config_->queue_sel, queue_sel);
+    uint32_t max = virtio_mmio_read32(&mmio_config_->queue_num_max);
+    return (max > UINT16_MAX) ? UINT16_MAX : static_cast<uint16_t>(max);
+}
+
 void virtio_mmio_bus::register_ring(uint32_t page_size, uint32_t queue_sel, uint32_t queue_num, uint32_t queue_align, uint32_t queue_pfn) {
     DEBUG_ASSERT(mmio_config_);
 

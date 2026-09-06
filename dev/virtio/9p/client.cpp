@@ -29,6 +29,7 @@
 #include <lk/debug.h>
 #include <lk/err.h>
 #include <lk/trace.h>
+#include <lktl/auto_call.h>
 #include <stdlib.h>
 
 #if WITH_KERNEL_VM

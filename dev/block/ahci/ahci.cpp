@@ -154,7 +154,7 @@ status_t ahci::init_device(pci_location_t loc) {
         DEBUG_ASSERT(disk);
 
         // add the disk to a list for further processing
-        list_add_tail(&disk_list_, &disk->node_);
+        disk_list_.push_back(disk);
     }
 
     return NO_ERROR;
@@ -163,16 +163,15 @@ status_t ahci::init_device(pci_location_t loc) {
 void ahci::disk_probe_worker() {
     LTRACE_ENTRY;
 
-    ahci_disk *disk;
-    list_for_every_entry(&disk_list_, disk, ahci_disk, node_) {
-        disk->identify();
+    for (ahci_disk &disk : disk_list_) {
+        disk.identify();
     }
 
     LTRACE_EXIT;
 }
 
 status_t ahci::start_disk_probe() {
-    if (list_is_empty(&disk_list_)) {
+    if (disk_list_.is_empty()) {
         return NO_ERROR;
     }
 

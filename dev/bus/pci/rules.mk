@@ -17,10 +17,10 @@ MODULE_SRCS += $(LOCAL_DIR)/backend/bios32.cpp
 MODULE_SRCS += $(LOCAL_DIR)/backend/type1.cpp
 
 MODULE_DEPS += lib/libcpp
+MODULE_DEPS += lib/lktl
 
 MODULE_OPTIONS += test
 
-MODULE_CPPFLAGS += -Wno-invalid-offsetof
 MODULE_COMPILEFLAGS += -Wmissing-declarations
 
 include make/module.mk

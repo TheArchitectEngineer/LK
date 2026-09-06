@@ -20,6 +20,7 @@
 #include <lk/list.h>
 #include <lk/reg.h>
 #include <lk/trace.h>
+#include <lktl/auto_call.h>
 #include <platform/interrupts.h>
 #include <string.h>
 

@@ -11,6 +11,7 @@ Welcome to the LK (Little Kernel) documentation. LK is a small operating system 
 ### Core Kernel Documentation
 - [Threading and Scheduler System](threading_and_scheduler.md) - Comprehensive guide to LK's preemptive multithreading system
 - [Blocking Primitives](blocking_primitives.md) - Synchronization primitives (mutexes, semaphores, events, ports, spinlocks)
+- [Intrusive Lists](list.md) - The lk/list.h doubly linked list and its C++ wrapper
 - [VMM Overview](vmm_overview.md) - Virtual Memory Management system architecture and implementation
 - [Filesystem Layer](fs.md) - The mount namespace, the vnode interface, and how to write a filesystem
 - [Source Tree Structure](source_tree_structure.md) - Organization and structure of the LK source code repository

@@ -27,6 +27,8 @@ public:
     virtual status_t virtio_status_features_ok() = 0;
     virtual void virtio_status_driver_ok() = 0;
     virtual void virtio_kick(uint16_t ring_index) = 0;
+    // Largest ring the device accepts for this queue; 0 if the queue does not exist.
+    virtual uint16_t virtio_queue_max_size(uint16_t queue_sel) = 0;
     virtual void register_ring(uint32_t page_size, uint32_t queue_sel, uint32_t queue_num, uint32_t queue_align, uint32_t queue_pfn) = 0;
 
     // Return if the device is legacy or modern.

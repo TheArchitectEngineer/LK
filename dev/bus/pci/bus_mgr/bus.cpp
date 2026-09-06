@@ -33,7 +33,7 @@ bus::bus(pci_location_t loc, bridge *b, root *r) : loc_(loc), b_(b), root_(r) {}
 
 void bus::add_device(device *d) {
     // TODO: assert that no two devices have the same address
-    list_add_tail(&child_devices_, &d->node);
+    child_devices_.push_back(d);
 }
 
 // walk all devices on a bus recursively walking into any bridge and scanning those busses
@@ -283,9 +283,8 @@ void bus::dump(size_t indent) {
         printf(" ");
     }
     printf("bus %d\n", loc().bus);
-    device *d;
-    list_for_every_entry(&child_devices_, d, device, node) {
-        d->dump(indent + 1);
+    for (device &d : child_devices_) {
+        d.dump(indent + 1);
     }
 }
 

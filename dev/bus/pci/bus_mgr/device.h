@@ -10,6 +10,7 @@
 #include <sys/types.h>
 #include <dev/bus/pci.h>
 #include <lk/cpp.h>
+#include <lktl/list.h>
 #include <lk/err.h>
 #include <lk/list.h>
 
@@ -21,7 +22,7 @@ class bus;
 struct capability;
 
 // generic pci device
-class device {
+class device : public lk::list_hook<> {
 public:
     device(pci_location_t loc, bus *bus);
     virtual ~device();
@@ -113,10 +114,6 @@ protected:
     bus *parent_bus() const { return bus_; }
 
 private:
-    // let the bus device directly manipulate our list node
-    friend class bus;
-    list_node node = LIST_INITIAL_CLEARED_VALUE;
-
     pci_location_t loc_ = {};
     bus *bus_ = nullptr;
 
@@ -129,7 +126,6 @@ private:
     capability *msix_cap_ = nullptr;
 
     // MSI-X saved details
-    uint32_t msix_table_size = {};
     void *msix_table_map = nullptr;
     void *msix_pba_map = nullptr;
     volatile uint32_t *msix_table_ptr = nullptr;

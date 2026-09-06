@@ -14,6 +14,7 @@
 #include <lk/cpp.h>
 #include <lk/err.h>
 #include <lk/trace.h>
+#include <lktl/auto_call.h>
 #include <memory>
 #include <new>
 #include <stdint.h>

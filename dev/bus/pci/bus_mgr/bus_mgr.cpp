@@ -32,8 +32,8 @@
 namespace pci {
 
 // all of the roots (host bridges) in the system, and every bus hanging off of them
-list_node root_list = LIST_INITIAL_VALUE(root_list);
-list_node bus_list = LIST_INITIAL_VALUE(bus_list);
+lk::list<root> root_list;
+lk::list<bus> bus_list;
 
 namespace {
 
@@ -57,7 +57,7 @@ root *get_default_root() {
     desc.bus_end = (last_bus < 0) ? 255 : (uint8_t)last_bus;
 
     default_root = new root(desc);
-    list_add_tail(&root_list, &default_root->node);
+    root_list.push_back(default_root);
     return default_root;
 }
 
@@ -65,9 +65,8 @@ template <typename F>
 status_t for_every_root(F func) {
     status_t err = NO_ERROR;
 
-    root *r;
-    list_for_every_entry(&root_list, r, root, node) {
-        err = func(r);
+    for (root &r : root_list) {
+        err = func(&r);
         if (err != NO_ERROR) {
             return err;
         }
@@ -81,9 +80,8 @@ template <typename F>
 status_t for_every_device_on_every_bus(F func) {
     status_t err = NO_ERROR;
 
-    bus *b;
-    list_for_every_entry(&bus_list, b, bus, node) {
-        err = b->for_every_device(func);
+    for (bus &b : bus_list) {
+        err = b.for_every_device(func);
         if (err != NO_ERROR) {
             return err;
         }
@@ -95,9 +93,8 @@ template <typename F>
 status_t for_every_bus(F func) {
     status_t err = NO_ERROR;
 
-    bus *b;
-    list_for_every_entry(&bus_list, b, bus, node) {
-        err = func(b);
+    for (bus &b : bus_list) {
+        err = func(&b);
         if (err != NO_ERROR) {
             return err;
         }
@@ -126,7 +123,7 @@ device *lookup_device_by_loc(pci_location_t loc) {
 
 // used by bus object to stuff itself into a global list
 void add_to_bus_list(bus *b) {
-    list_add_tail(&bus_list, b->list_node_ptr());
+    bus_list.push_back(b);
 }
 
 // find a bus by segment and number
@@ -161,18 +158,17 @@ status_t pci_bus_mgr_add_root(const struct pci_root_desc *desc) {
             desc->bus_end, desc->num_windows);
 
     // reject roots that overlap an existing one
-    root *r;
-    list_for_every_entry(&root_list, r, root, node) {
-        if (r->segment() == desc->segment && desc->bus_start <= r->bus_end() &&
-            desc->bus_end >= r->bus_start()) {
+    for (const root &r : root_list) {
+        if (r.segment() == desc->segment && desc->bus_start <= r.bus_end() &&
+            desc->bus_end >= r.bus_start()) {
             printf("PCI: root %04x:[%02x...%02x] overlaps an existing root\n", desc->segment,
                    desc->bus_start, desc->bus_end);
             return ERR_ALREADY_EXISTS;
         }
     }
 
-    r = new root(*desc);
-    list_add_tail(&root_list, &r->node);
+    root *r = new root(*desc);
+    root_list.push_back(r);
     return NO_ERROR;
 }
 
@@ -198,7 +194,7 @@ status_t pci_bus_mgr_init() {
     }
 
     // if the platform didn't register any roots, make one up covering segment 0
-    if (list_is_empty(&root_list)) {
+    if (root_list.is_empty()) {
         get_default_root();
     }
 
