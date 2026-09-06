@@ -12,6 +12,7 @@
 #include <lk/cpp.h>
 #include <lk/debug.h>
 #include <lk/err.h>
+#include <lktl/auto_call.h>
 #include <malloc.h>
 #include <memory>
 #include <new>

@@ -10,4 +10,6 @@ MODULE_DEPS += \
 	dev/virtio \
 	lib/bio
 
+MODULE_DEPS += lib/lktl
+
 include make/module.mk

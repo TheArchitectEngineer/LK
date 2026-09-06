@@ -36,6 +36,7 @@ Core kernel functionality:
 Library and utility code:
 - `libc/` - Basic C library functions
 - `libcpp/` - Subset of the C++ standard library
+- `lktl/` - LK's own C++ library (namespace `lk`), header only
 - `libm/` - Math library
 - `bio/` - Block I/O layer
 - `fs/` - File system support

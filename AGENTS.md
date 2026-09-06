@@ -1,6 +1,6 @@
 # LK Kernel Development Guide
 
-LK is a small, SMP-aware embedded OS kernel designed for supervisor mode on diverse 32/64-bit architectures. It's used extensively in embedded systems, including Android bootloaders. Written primarily in C and assembly, with a limited C++ subset: `lib/libcpp` provides a curated portion of the C++17 standard library (see `lib/libcpp/include/` for the authoritative list), built with no exceptions, no RTTI, and no dynamic containers.
+LK is a small, SMP-aware embedded OS kernel designed for supervisor mode on diverse 32/64-bit architectures. It's used extensively in embedded systems, including Android bootloaders. Written primarily in C and assembly, with a limited C++ subset: `lib/libcpp` provides a curated portion of the C++17 standard library (see `lib/libcpp/include/` for the authoritative list), built with no exceptions, no RTTI, and no dynamic containers. `lib/lktl` is LK's own header-only C++ library (namespace `lk`: the intrusive list, `auto_call`); `lk/cpp.h` holds the `DISALLOW_*` macros.
 
 ## Architecture Overview
 
@@ -366,6 +366,15 @@ For in-progress (WIP) work on a branch that is intended to be collapsed or merge
 - If a function needs to return a positive value on success, it returns that directly and uses negative for errors: `int count = count_items(); if (count < 0) { /* handle error */ }`
 - Error codes are defined in `include/lk/err.h` (e.g. `ERR_NOT_FOUND`, `ERR_NO_MEMORY`, etc.) and are negative integers.
 
+#### Intrusive lists
+
+`lk/list.h` is the doubly linked list used throughout the kernel: `struct list_node` embedded
+in the object, the head is itself a node, `containerof()` gets back to the object. C++ classes
+derive from `lk::list_hook<>` and use `lk::list<T>` / `lk::list_view<T>` from `lktl/list.h`
+(module `lib/lktl`) instead of embedding a node: `containerof()` is `offsetof()`, which is
+undefined for a non-standard-layout class (virtuals, mixed access). `LK_LIST_MEMBER_TRAITS`
+covers C structs. See `docs/list.md`.
+
 #### Registering Console Commands
 
 Commands appear in shell when `app/shell` module is included:
@@ -563,6 +572,7 @@ moved any text the table names, so a link order or relaxation surprise is loud.
 - `kernel/vm/` - Virtual memory subsystem (for MMU architectures)
 - `lib/libc/` - Minimal C library (string, stdio, stdlib basics)
 - `lib/libcpp/` - Freestanding subset of the C++ standard library (headers in `lib/libcpp/include/`)
+- `lib/lktl/` - LK's own C++ library, header only, namespace `lk` (headers in `lib/lktl/include/lktl/`)
 - `top/` - Top level module in the system. Contains the kernel's lk_main() system init routines.
    Also contains top level lk/ include headers.
 

@@ -18,6 +18,7 @@ MODULE_FLOAT_SRCS := \
 MODULE_COMPILEFLAGS += -ffp-contract=off
 
 MODULE_DEPS := lib/libcpp
+MODULE_DEPS += lib/lktl
 MODULE_DEPS += lib/unittest
 
 include make/module.mk
