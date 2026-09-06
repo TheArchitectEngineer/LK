@@ -30,6 +30,7 @@
 #include <lk/compiler.h>
 #include <lk/list.h>
 #include <sys/types.h>
+#include <type_traits>
 
 namespace lk {
 
@@ -124,6 +125,10 @@ public:
         constexpr basic_iterator() = default;
         constexpr explicit basic_iterator(list_node *n) : node_(n) {}
 
+        // an iterator converts to a const_iterator, never the other way round
+        template <typename V, typename = std::enable_if_t<std::is_same_v<U, const V>>>
+        constexpr basic_iterator(const basic_iterator<V> &other) : node_(other.node()) {}
+
         U &operator*() const { return *Traits::to_object(node_); }
         U *operator->() const { return Traits::to_object(node_); }
 
@@ -146,8 +151,13 @@ public:
             return old;
         }
 
-        bool operator==(const basic_iterator &other) const { return node_ == other.node_; }
-        bool operator!=(const basic_iterator &other) const { return node_ != other.node_; }
+        // hidden friends, so a mixed iterator / const_iterator comparison converts either side
+        friend bool operator==(const basic_iterator &a, const basic_iterator &b) {
+            return a.node_ == b.node_;
+        }
+        friend bool operator!=(const basic_iterator &a, const basic_iterator &b) {
+            return a.node_ != b.node_;
+        }
 
         list_node *node() const { return node_; }
 

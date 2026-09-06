@@ -185,6 +185,13 @@ bool iteration() {
     EXPECT_TRUE(cl.front() == &w[0]);
     EXPECT_TRUE(cl.back() == &w[2]);
 
+    // an iterator converts to a const_iterator and compares with one
+    lk::list<widget>::const_iterator cit = l.begin();
+    EXPECT_TRUE(cit == cl.begin());
+    EXPECT_TRUE(l.begin() == cl.begin());
+    EXPECT_TRUE(cl.end() != l.begin());
+    static_assert(!std::is_convertible_v<lk::list<widget>::const_iterator, lk::list<widget>::iterator>);
+
     // backwards from end()
     auto it = l.end();
     --it;
