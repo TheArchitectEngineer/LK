@@ -107,20 +107,6 @@ ifneq ($(MODULE_OPTIONS_COPY),)
 $(error MODULE $(MODULE) has unrecognized option(s) $(MODULE_OPTIONS_COPY))
 endif
 
-# if MODULE_SRCS and MODULE_FLOAT_SRCS are both empty, skip the rest of this
-# file as there is nothing to build for this module.
-ifneq ($(MODULE_SRCS)$(MODULE_FLOAT_SRCS)$(MODULE_ARM_OVERRIDE_SRCS),)
-
-#$(info module $(MODULE))
-#$(info MODULE_COMPILEFLAGS = $(MODULE_COMPILEFLAGS))
-#$(info MODULE_SRCDIR $(MODULE_SRCDIR))
-#$(info MODULE_BUILDDIR $(MODULE_BUILDDIR))
-#$(info MODULE_DEPS $(MODULE_DEPS))
-#$(info MODULE_SRCS $(MODULE_SRCS))
-#$(info MODULE_FLOAT_SRCS $(MODULE_FLOAT_SRCS))
-#$(info MODULE_ARM_OVERRIDE_SRCS $(MODULE_ARM_OVERRIDE_SRCS))
-#$(info MODULE_OPTIONS $(MODULE_OPTIONS))
-
 MODULE_DEFINES += MODULE_NAME=\"$(subst $(SPACE),_,$(MODULE))\"
 MODULE_DEFINES += MODULE_OPTIONS=\"$(subst $(SPACE),_,$(MODULE_OPTIONS))\"
 MODULE_DEFINES += MODULE_COMPILEFLAGS=\"$(subst $(SPACE),_,$(MODULE_COMPILEFLAGS))\"
@@ -136,7 +122,9 @@ MODULE_DEFINES += MODULE_SRCS=\"$(subst $(SPACE),_,$(MODULE_SRCS))\"
 MODULE_DEFINES += MODULE_FLOAT_SRCS=\"$(subst $(SPACE),_,$(MODULE_FLOAT_SRCS))\"
 MODULE_DEFINES += MODULE_ARM_OVERRIDE_SRCS=\"$(subst $(SPACE),_,$(MODULE_ARM_OVERRIDE_SRCS))\"
 
-# generate a per-module config.h file
+# generate a per-module config.h file. A module with nothing to compile gets one
+# too: scripts/check-module-deps.py learns the modules in a build and their
+# MODULE_DEPS / MODULE_WEAK_DEPS from these files.
 MODULE_CONFIG := $(MODULE_BUILDDIR)/module_config.h
 
 $(MODULE_CONFIG): MODULE_DEFINES:=$(MODULE_DEFINES)
@@ -144,6 +132,20 @@ $(MODULE_CONFIG): configheader
 	@$(call MAKECONFIGHEADER,$@,MODULE_DEFINES)
 
 GENERATED += $(MODULE_CONFIG)
+
+# if MODULE_SRCS and MODULE_FLOAT_SRCS are both empty, skip the rest of this
+# file as there is nothing to build for this module.
+ifneq ($(MODULE_SRCS)$(MODULE_FLOAT_SRCS)$(MODULE_ARM_OVERRIDE_SRCS),)
+
+#$(info module $(MODULE))
+#$(info MODULE_COMPILEFLAGS = $(MODULE_COMPILEFLAGS))
+#$(info MODULE_SRCDIR $(MODULE_SRCDIR))
+#$(info MODULE_BUILDDIR $(MODULE_BUILDDIR))
+#$(info MODULE_DEPS $(MODULE_DEPS))
+#$(info MODULE_SRCS $(MODULE_SRCS))
+#$(info MODULE_FLOAT_SRCS $(MODULE_FLOAT_SRCS))
+#$(info MODULE_ARM_OVERRIDE_SRCS $(MODULE_ARM_OVERRIDE_SRCS))
+#$(info MODULE_OPTIONS $(MODULE_OPTIONS))
 
 MODULE_COMPILEFLAGS += -include $(MODULE_CONFIG)
 
@@ -183,7 +185,8 @@ ALLMODULE_OBJS := $(ALLMODULE_OBJS) $(MODULE_OBJS) $(MODULE_EXTRA_OBJS)
 endif
 
 else # ifneq ($(MODULE_ALL_SRCS),)
-#$(info MODULE $(MODULE) has no source files, skipping)
+# nothing to compile, so nothing depends on the config header; build it explicitly
+EXTRA_BUILDDEPS += $(MODULE_CONFIG)
 endif
 
 # empty out any vars set here
