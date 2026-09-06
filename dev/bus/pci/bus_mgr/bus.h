@@ -10,6 +10,7 @@
 #include <sys/types.h>
 #include <dev/bus/pci.h>
 #include <lk/cpp.h>
+#include <lktl/list.h>
 #include <lk/err.h>
 
 #include "device.h"
@@ -21,7 +22,7 @@ class resource_allocator;
 class root;
 
 // bus device holds a list of devices and a reference to its bridge device
-class bus {
+class bus : public lk::list_hook<> {
 public:
     bus(pci_location_t loc, bridge *b, root *r);
     ~bus() = default;
@@ -50,15 +51,11 @@ public:
 
     void add_to_global_list();
 
-    // master list of busses for easy iteration
-    list_node node = LIST_INITIAL_CLEARED_VALUE;
-    list_node *list_node_ptr() { return &node; }
-
 private:
     pci_location_t loc_ = {};
     bridge *b_ = nullptr;   // upstream bridge, nullptr for a root bus
     root *root_ = nullptr;  // the root this bus hangs off of
-    list_node child_devices_ = LIST_INITIAL_VALUE(child_devices_);
+    lk::list<device> child_devices_;
 };
 
 // call the provided functor on every device in this bus
@@ -66,9 +63,8 @@ template <typename F>
 inline status_t bus::for_every_device(F func) {
     status_t err = NO_ERROR;
 
-    device *d;
-    list_for_every_entry(&child_devices_, d, device, node) {
-        err = func(d);
+    for (device &d : child_devices_) {
+        err = func(&d);
         if (err != NO_ERROR) {
             return err;
         }

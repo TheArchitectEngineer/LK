@@ -16,7 +16,6 @@ MODULE_SRCS += $(LOCAL_DIR)/file_iterator.cpp
 MODULE_SRCS += $(LOCAL_DIR)/fs.cpp
 
 MODULE_COMPILEFLAGS += -Wmissing-declarations
-MODULE_CPPFLAGS += -Wno-invalid-offsetof
 
 MODULE_OPTIONS := test
 

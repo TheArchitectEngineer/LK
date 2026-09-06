@@ -9,8 +9,8 @@
 
 #include <sys/types.h>
 #include <lk/cpp.h>
+#include <lktl/list.h>
 #include <lk/err.h>
-#include <lk/list.h>
 #include <dev/bus/pci.h>
 
 #include "resource.h"
@@ -23,7 +23,7 @@ class bus;
 // address windows it decodes and an optional legacy interrupt routing hook. Every probed bus
 // belongs to exactly one root. Platforms register roots with pci_bus_mgr_add_root(); if none
 // are registered a default root covering segment 0 is created at init time.
-class root {
+class root : public lk::list_hook<> {
 public:
     explicit root(const pci_root_desc &desc);
     ~root();
@@ -56,9 +56,6 @@ public:
     resource_allocator &allocator() { return allocator_; }
 
     void dump(size_t indent = 0);
-
-    // master list of roots
-    list_node node = LIST_INITIAL_CLEARED_VALUE;
 
 private:
     pci_root_desc desc_;
