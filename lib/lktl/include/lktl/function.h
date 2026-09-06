@@ -7,21 +7,48 @@
  */
 #pragma once
 
-// lk::function<R(Args...), Size>: an owning std::function that never touches the heap.
-// The callable lives inside the object, in Size bytes (two words by default), so a lambda
+// lk::function<R(Args...), Size>: an owning std::function that never touches the heap. The
+// callable lives inside the object, in Size bytes (two words by default), so a lambda
 // capturing a this pointer and one more word fits and anything larger is a compile error
-// rather than an allocation. Move only; one indirect call per invocation; no RTTI.
+// that prints both sizes, never an allocation. Move only; one indirect call per invocation.
 //
-//   lk::function<void(status_t)> on_done = [this](status_t s) { finish(s); };
-//   on_done(NO_ERROR);
+// Patterns:
 //
-// Calling an empty one panics. An empty one is constant-initialized, so a global is valid
-// before constructors run, though like any object with a destructor it still costs a
-// __cxa_atexit registration at boot. Callables need at most 8 byte alignment. For a callback
-// that is only used during the call it is passed to, lk::function_ref is two words, copies
-// nothing and has no size limit.
+//   // a callback stored on an object, with this captured
+//   class disk {
+//       lk::function<void(status_t)> on_done_;
+//       void start() {
+//           on_done_ = [this](status_t s) { finish(s); };
+//           on_done_ = lk::method<&disk::finish>(this);      // same, without restating args
+//       }
+//   };
+//
+//   // a plain function, a lambda with a word of state, a method on another object
+//   lk::function<int(int)> f = add_one;
+//   lk::function<void()> g = [p, n]() { p->count += n; };
+//   lk::function<void(bdev_t *)> h = lk::method<&cache::flush>(cache_);
+//
+//   // more capture room, when the callable needs it
+//   lk::function<void(), 4 * sizeof(void *)> big = [a, b, c, d]() { ... };
+//
+//   // empty, test, call, clear
+//   lk::function<void()> cb;      // empty; calling it panics
+//   if (cb) {
+//       cb();
+//   }
+//   cb = nullptr;
+//
+//   // handing one to something that keeps it is a move
+//   register_completion(std::move(on_done_));
+//
+// For a callback the callee only uses before it returns, take an lk::function_ref instead:
+// two words, nothing copied, no size limit. A function refuses to store a function_ref, since
+// that would dangle. An empty function is constant-initialized, so a global one is valid
+// before constructors run, though like any object with a destructor it registers with
+// __cxa_atexit at boot. Callables need at most 8 byte alignment.
 
 #include <lk/debug.h>
+#include <lktl/method.h>
 #include <new>
 #include <stddef.h>
 #include <type_traits>

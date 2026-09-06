@@ -11,17 +11,44 @@
 // struct list_node and every link operation is one of the C inlines, so a list built on
 // one side of the language boundary can be walked on the other.
 //
-// Two ways to attach a type:
+// Patterns:
 //
-//   class foo : public lk::list_hook<> { ... };    // any class; offsetof is never used
-//   lk::list<foo> foos;
-//   foos.push_back(&f);
+//   // a class on a list: derive from the hook (any class; offsetof is never used)
+//   class foo : public lk::list_hook<> {
+//       ...
+//   };
+//   lk::list<foo> foos;                    // constant-initialized when global
+//
+//   foos.push_back(&f);                    // f must not be on a list already
+//   foo *first = foos.front();             // nullptr when empty
+//   foo *next = foos.next(&f);             // nullptr at the end
 //   for (foo &x : foos) { ... }
+//   for (auto it = foos.begin(); it != foos.end();) {       // remove while walking
+//       if (done(*it)) {
+//           it = foos.erase(it);
+//       } else {
+//           ++it;
+//       }
+//   }
+//   foos.remove(&f);                       // needs no head, like list_delete()
+//   while (foo *x = foos.pop_front()) { ... }
+//   if (f.in_list()) { ... }
 //
-//   struct bar { int v; struct list_node node; };  // standard-layout only; uses containerof
+//   // on two lists at once: one hook per tag
+//   struct child_tag {};
+//   class node : public lk::list_hook<>, public lk::list_hook<child_tag> { ... };
+//   lk::list<node, lk::base_hook_traits<node, child_tag>> children;
+//
+//   // a C struct with an embedded node (standard-layout only; uses containerof)
+//   struct bar { int v; struct list_node node; };
 //   LK_LIST_MEMBER_TRAITS(bar_traits, bar, node);
 //   lk::list<bar, bar_traits> bars;
-//   lk::list_view<bar, bar_traits> view(&head_owned_by_c_code);
+//
+//   // a list that C owns, walked from C++; and a C++ list handed to C
+//   lk::list_view<bar, bar_traits> view(&head_in_a_c_struct);
+//   for (bar &b : view) { ... }
+//   list_for_every(foos.c_head(), node) { ... }              // C side, raw nodes
+//   list_add_tail(&c_head, f.list_node_ptr());               // C side, a hooked object
 //
 // A list at namespace scope is constant-initialized, so it is valid before
 // call_constructors() has run.

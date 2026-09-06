@@ -10,18 +10,33 @@
 // lk::function_ref<R(Args...)>: a non-owning reference to a callable. Two words, the
 // callable's address and a thunk, trivially copyable, so it passes in registers and costs
 // what two pointer arguments cost. It is the parameter type for a callback the callee only
-// uses before it returns, a visitor being the usual case:
+// uses before it returns, a visitor being the usual case.
 //
+// Patterns:
+//
+//   // the parameter
 //   status_t for_every_device(lk::function_ref<status_t(device *)> fn);
 //
-//   for_every_device([&](device *d) { count++; return NO_ERROR; });
+//   // the ways to call it
+//   for_every_device([&](device *d) { count++; return NO_ERROR; });   // lambda in the call
+//   for_every_device(lk::method<&probe::visit>(this));                // a method of this
+//   for_every_device(check_device);                                   // a plain function
+//   for_every_device(on_device_);                                     // an lk::function
+//
+//   // inside the callee
+//   for (device &d : devices_) {
+//       status_t err = fn(&d);
+//       ...
+//   }
 //
 // Nothing is copied, so there is no size limit on the callable, but the reference is only
-// good for as long as the callable lives: a lambda written in the argument list lives to the
-// end of that statement. Never keep a function_ref past the call it was passed to; store an
-// lk::function instead.
+// good while the callable lives: a lambda written in the argument list lives to the end of
+// that statement. Never keep a function_ref in a member, return one, or hand one to another
+// thread; take an lk::function by value and move it instead. A small loop in the same
+// translation unit is smaller as a template than through either.
 
 #include <assert.h>
+#include <lktl/method.h>
 #include <stdint.h>
 #include <type_traits>
 #include <utility>

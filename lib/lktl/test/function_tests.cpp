@@ -11,6 +11,7 @@
 
 #include <lktl/function.h>
 #include <lktl/function_ref.h>
+#include <lktl/method.h>
 
 #include <lib/unittest.h>
 #include <type_traits>
@@ -155,6 +156,22 @@ bool function_global() {
     END_TEST;
 }
 
+struct widget {
+    int total = 0;
+    int add(int x) {
+        total += x;
+        return total;
+    }
+    int peek() const { return total; }
+    void clear() { total = 0; }
+};
+
+// the C API shapes, cookie first and cookie last
+typedef int (*add_cookie_first_t)(void *cookie, int x);
+typedef int (*add_cookie_last_t)(int x, void *cookie);
+typedef int (*peek_cookie_first_t)(void *cookie);
+typedef void (*clear_cookie_last_t)(void *cookie);
+
 int apply(lk::function_ref<int(int)> fn, int v) { return fn(v); }
 
 void visit3(lk::function_ref<void(int)> fn) {
@@ -196,12 +213,50 @@ bool function_ref_basics() {
     END_TEST;
 }
 
+bool method_binding() {
+    BEGIN_TEST;
+
+    widget w;
+
+    // a method with this captured, stored in a function: one word of capture
+    static_assert(sizeof(decltype(lk::method<&widget::add>(&w))) == sizeof(void *));
+    lk::function<int(int)> add = lk::method<&widget::add>(&w);
+    EXPECT_EQ(3, add(3));
+    EXPECT_EQ(7, add(4));
+    EXPECT_EQ(7, w.total);
+
+    // a const method on a const object, a void method
+    const widget &cw = w;
+    lk::function<int()> peek = lk::method<&widget::peek>(&cw);
+    EXPECT_EQ(7, peek());
+    lk::function<void()> clear = lk::method<&widget::clear>(&w);
+    clear();
+    EXPECT_EQ(0, w.total);
+
+    // passed where a function_ref is wanted
+    EXPECT_EQ(2, apply(lk::method<&widget::add>(&w), 2));
+
+    // the C API shapes: the pointer has exactly the typedef's type, the object is the cookie
+    add_cookie_first_t first = lk::method_cookie_first<&widget::add>;
+    EXPECT_EQ(3, first(&w, 1));
+    add_cookie_last_t last = lk::method_cookie_last<&widget::add>;
+    EXPECT_EQ(5, last(2, &w));
+    peek_cookie_first_t cpeek = lk::method_cookie_first<&widget::peek>;
+    EXPECT_EQ(5, cpeek(&w));
+    clear_cookie_last_t cclear = lk::method_cookie_last<&widget::clear>;
+    cclear(&w);
+    EXPECT_EQ(0, w.total);
+
+    END_TEST;
+}
+
 BEGIN_TEST_CASE(function_tests)
 RUN_TEST(function_basics)
 RUN_TEST(function_state)
 RUN_TEST(function_lifetime)
 RUN_TEST(function_global)
 RUN_TEST(function_ref_basics)
+RUN_TEST(method_binding)
 END_TEST_CASE(function_tests)
 
 } // namespace

@@ -381,7 +381,10 @@ covers C structs. See `docs/list.md`.
 callee only uses before it returns; it borrows the callable, two words, no size limit.
 `lk::function<R(Args...)>` (`lktl/function.h`) owns its callable inline, two words by default, for
 a callback that is stored; never store a `function_ref`. Neither touches the heap. A small loop in
-the same translation unit stays smaller as a template than through either.
+the same translation unit stays smaller as a template than through either. `lk::method<&T::m>(obj)`
+(`lktl/method.h`) binds a method with its object for either, and `lk::method_cookie_first<&T::m>` /
+`lk::method_cookie_last<&T::m>` are the function pointer to hand a C API that takes a `void *cookie`,
+with the object as the cookie.
 
 #### Registering Console Commands
 
