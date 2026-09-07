@@ -158,13 +158,22 @@ public:
     constexpr function() : storage_{}, ops_(&internal::empty_function_ops<R, Args...>) {}
     constexpr function(decltype(nullptr)) : function() {}
 
-    // from any callable; a null function pointer gives an empty function
+    // from any callable object: a lambda, or anything else with an operator()
     template <typename C, typename D = std::decay_t<C>,
-              typename = std::enable_if_t<!std::is_same_v<D, function>>,
+              typename = std::enable_if_t<!std::is_same_v<D, function> &&
+                                          !std::is_function_v<std::remove_reference_t<C>>>,
               typename = internal::function_callable_t<D, R, Args...>>
     function(C &&callable) : ops_(&internal::empty_function_ops<R, Args...>) {
         assign(std::forward<C>(callable));
     }
+
+    // From a plain function, taken as a pointer and never as a reference: on thumb a
+    // function's address carries the interworking bit in bit 0, so a reference bound to the
+    // function itself is a reference to an odd address. A null pointer gives an empty
+    // function.
+    template <typename F, typename = std::enable_if_t<std::is_function_v<F>>,
+              typename = internal::function_callable_t<F *, R, Args...>>
+    function(F *fn) : ops_(&internal::empty_function_ops<R, Args...>) { assign(fn); }
 
     function(function &&other) noexcept { take(other); }
     function &operator=(function &&other) noexcept {
@@ -176,12 +185,21 @@ public:
     }
 
     template <typename C, typename D = std::decay_t<C>,
-              typename = std::enable_if_t<!std::is_same_v<D, function>>,
+              typename = std::enable_if_t<!std::is_same_v<D, function> &&
+                                          !std::is_function_v<std::remove_reference_t<C>>>,
               typename = internal::function_callable_t<D, R, Args...>>
     function &operator=(C &&callable) {
         ops_->destroy(storage_);
         ops_ = &internal::empty_function_ops<R, Args...>;
         assign(std::forward<C>(callable));
+        return *this;
+    }
+    template <typename F, typename = std::enable_if_t<std::is_function_v<F>>,
+              typename = internal::function_callable_t<F *, R, Args...>>
+    function &operator=(F *fn) {
+        ops_->destroy(storage_);
+        ops_ = &internal::empty_function_ops<R, Args...>;
+        assign(fn);
         return *this;
     }
     function &operator=(decltype(nullptr)) {
@@ -215,11 +233,10 @@ private:
         constexpr bool fits = internal::function_capacity<sizeof(D), storage_size>::ok &&
                               internal::function_alignment<alignof(D), internal::function_storage_align>::ok;
         if constexpr (fits) {
+            // a plain function reaches here as a pointer, so this is the null check the
+            // class documents; a null one leaves the function empty
             if constexpr (std::is_pointer_v<D>) {
-                // decay first: a function passed by name arrives as a reference, whose
-                // address is never null, and gcc says so
-                D fn = callable;
-                if (fn == nullptr) {
+                if (callable == nullptr) {
                     return;
                 }
             }

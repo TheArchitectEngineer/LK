@@ -53,14 +53,25 @@ public:
 
     constexpr function_ref() = default;
 
-    // from any callable, including a plain function
+    // from any callable object: a lambda, an lk::function, anything with an operator()
     template <typename C, typename D = std::remove_reference_t<C>,
-              typename = std::enable_if_t<!std::is_same_v<std::decay_t<C>, function_ref>>,
+              typename = std::enable_if_t<!std::is_same_v<std::decay_t<C>, function_ref> &&
+                                          !std::is_function_v<D>>,
               typename = std::enable_if_t<
                   std::is_void_v<R> ||
                   std::is_convertible_v<decltype(std::declval<D &>()(std::declval<Args>()...)), R>>>
     function_ref(C &&callable) noexcept
         : callable_(reinterpret_cast<intptr_t>(&callable)), callback_(&invoke<D>) {}
+
+    // from a plain function, taken as a pointer and never as a reference: on thumb a
+    // function's address carries the interworking bit in bit 0, so a reference bound to the
+    // function itself is a reference to an odd address
+    template <typename F, typename = std::enable_if_t<std::is_function_v<F>>,
+              typename = std::enable_if_t<
+                  std::is_void_v<R> ||
+                  std::is_convertible_v<decltype(std::declval<F *>()(std::declval<Args>()...)), R>>>
+    function_ref(F *fn) noexcept
+        : callable_(reinterpret_cast<intptr_t>(fn)), callback_(&invoke_fn<F>) {}
 
     explicit operator bool() const { return callback_ != nullptr; }
 
@@ -77,6 +88,17 @@ private:
             c(std::forward<Args>(args)...);
         } else {
             return c(std::forward<Args>(args)...);
+        }
+    }
+
+    // the plain function case, where callable is the function's own address
+    template <typename F>
+    static R invoke_fn(intptr_t callable, Args... args) {
+        F *fn = reinterpret_cast<F *>(callable);
+        if constexpr (std::is_void_v<R>) {
+            fn(std::forward<Args>(args)...);
+        } else {
+            return fn(std::forward<Args>(args)...);
         }
     }
 

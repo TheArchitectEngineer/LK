@@ -21,6 +21,7 @@ namespace {
 
 int add_one(int x) { return x + 1; }
 void bump(int &x) { x++; }
+int bump_and_report(int &x) { return ++x; }
 
 static_assert(sizeof(lk::function<void()>) <= 4 * sizeof(void *));
 static_assert(!std::is_copy_constructible_v<lk::function<void()>>);
@@ -68,6 +69,11 @@ bool function_basics() {
     f = null_fn;
     EXPECT_FALSE(f);
 
+    // a function pointer variable stores the same way a function name does
+    int (*fn_ptr)(int) = add_one;
+    f = fn_ptr;
+    EXPECT_EQ(4, f(3));
+
     // reference arguments, and a result the signature discards
     lk::function<void(int &)> g = bump;
     int v = 0;
@@ -76,6 +82,9 @@ bool function_basics() {
     lk::function<void(int &)> h = [](int &x) { x += 10; return x; };
     h(v);
     EXPECT_EQ(11, v);
+    lk::function<void(int &)> i = bump_and_report;
+    i(v);
+    EXPECT_EQ(12, v);
 
     END_TEST;
 }
@@ -183,8 +192,11 @@ void visit3(lk::function_ref<void(int)> fn) {
 bool function_ref_basics() {
     BEGIN_TEST;
 
-    // a plain function, a lambda written in the argument list, a const callable
+    // a plain function, a pointer to one, a lambda written in the argument list, a const
+    // callable
     EXPECT_EQ(2, apply(add_one, 1));
+    int (*fn_ptr)(int) = add_one;
+    EXPECT_EQ(3, apply(fn_ptr, 2));
     EXPECT_EQ(9, apply([](int x) { return x * x; }, 3));
     const auto plus_five = [](int x) { return x + 5; };
     EXPECT_EQ(6, apply(plus_five, 1));
