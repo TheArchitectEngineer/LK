@@ -10,9 +10,15 @@
 
 #ifndef ASSEMBLY
 
+/* before arch/ops.h so it leaves out its empty arch_spinloop_pause() */
+#define ARCH_HAS_SPINLOOP_PAUSE 1
 #include <arch/ops.h>
 #include <arch/x86.h>
 #include <lk/compiler.h>
+
+static inline void arch_spinloop_pause(void) {
+    __asm__ volatile("pause" ::: "memory");
+}
 
 static inline ulong arch_cycle_count(void) {
 #if X86_LEGACY

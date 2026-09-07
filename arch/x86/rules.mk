@@ -82,6 +82,7 @@ MODULE_SRCS += \
 \
 	$(LOCAL_DIR)/apicid.c \
 	$(LOCAL_DIR)/arch.c \
+	$(LOCAL_DIR)/tlb.c \
 	$(LOCAL_DIR)/cache.c \
 	$(LOCAL_DIR)/clocks.c \
 	$(LOCAL_DIR)/descriptor.c \

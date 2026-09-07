@@ -30,6 +30,12 @@ RISCV_EXTENSION_LIST ?=
 ARCH_RISCV_EMBEDDED ?= false
 ARCH_RISCV_TWOSEGMENT ?= false
 
+# Set to 1 to run every user address space on asid 0 with a flush per switch,
+# the way a cpu without a full 16 bit asid field is handled, even when the cpu
+# has one. Only useful for testing that path; qemu implements all 16 bits.
+RISCV_ASID_FALLBACK ?= 0
+GLOBAL_DEFINES += RISCV_ASID_FALLBACK=$(RISCV_ASID_FALLBACK)
+
 GLOBAL_DEFINES += SMP_MAX_CPUS=$(SMP_MAX_CPUS)
 GLOBAL_DEFINES += PLATFORM_HAS_DYNAMIC_TIMER=1
 

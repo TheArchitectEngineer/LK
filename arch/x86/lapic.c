@@ -204,7 +204,7 @@ static enum handler_return lapic_spurious_handler(void *arg) {
 static enum handler_return lapic_generic_handler(void *arg) {
     LTRACEF("cpu %u, arg %p\n", arch_curr_cpu_num(), arg);
 
-    return INT_NO_RESCHEDULE;
+    return mp_mbx_generic_irq();
 }
 
 static enum handler_return lapic_reschedule_handler(void *arg) {

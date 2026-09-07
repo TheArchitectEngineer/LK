@@ -79,8 +79,18 @@ static inline void arm64_fpu_pre_context_switch(struct thread *thread) {
     }
 }
 
-/* overridable syscall handler */
+/*
+ * Hooks for exceptions taken from EL0, both overridable (the defaults are weak).
+ * They run in exception context on the thread's kernel stack with interrupts
+ * disabled; returning resumes user space at iframe->elr. The defaults print the
+ * frame and end the thread rather than the kernel.
+ */
 void arm64_syscall(struct arm64_iframe_long *iframe, bool is_64bit);
+void arm64_user_exception(struct arm64_iframe_long *iframe, uint32_t esr, uint64_t far);
+
+/* what the hooks do unless overridden; an override can fall back to these */
+void arm64_syscall_unhandled(struct arm64_iframe_long *iframe, bool is_64bit) __NO_RETURN;
+void arm64_user_exception_unhandled(struct arm64_iframe_long *iframe, uint32_t esr, uint64_t far) __NO_RETURN;
 
 /* Local per-cpu cache flush routines.
  * These routines clean or invalidate the cache from the point of view
