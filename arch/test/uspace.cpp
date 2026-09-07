@@ -22,8 +22,8 @@
 #include <kernel/thread.h>
 #include <kernel/vm.h>
 #include <lib/unittest.h>
-#include <lk/cpp.h>
 #include <lk/err.h>
+#include <lktl/auto_call.h>
 #include <string.h>
 
 #if ARCH_ARM64
