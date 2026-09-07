@@ -34,7 +34,7 @@ SYMTAB_PASS1_DATA_OBJ := $(BUILDDIR)/symtab_data_pass1.o
 SYMTAB_DATA_C := $(BUILDDIR)/symtab_data.c
 SYMTAB_DATA_OBJ := $(BUILDDIR)/symtab_data.o
 SYMTAB_VERIFY_STAMP := $(BUILDDIR)/symtab-verify.stamp
-SYMTAB_GENERATOR := scripts/gen-symtab.py
+SYMTAB_GENERATOR := $(LKROOT)/scripts/gen-symtab.py
 
 # Everything the final image is linked from except the table itself.
 SYMTAB_LINK_OBJS := $(ALLMODULE_OBJS) $(filter-out $(SYMTAB_DATA_OBJ),$(EXTRA_OBJS))
